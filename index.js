@@ -12,6 +12,50 @@ app.use(express.json({ limit: "2mb" }));
 
 const { PORT = 3000, DOWNLOADER_TOKEN } = process.env;
 
+const RENDER_NODE_PATH = "/usr/bin/node";
+const hasRenderNodePath = fs.existsSync(RENDER_NODE_PATH);
+
+function sanitizeUrlForLogs(raw) {
+  try {
+    const parsed = new URL(raw);
+    const sensitiveParams = ["token", "sig", "signature", "auth", "key", "api_key"];
+    for (const name of sensitiveParams) {
+      if (parsed.searchParams.has(name)) parsed.searchParams.set(name, "REDACTED");
+    }
+    return parsed.toString();
+  } catch {
+    return raw;
+  }
+}
+
+function sanitizeYtDlpArgsForLogs(args) {
+  return args.map((arg) => (typeof arg === "string" && /^https?:\/\//.test(arg) ? sanitizeUrlForLogs(arg) : arg));
+}
+
+function runYtDlp(args, onClose) {
+  const sanitized = sanitizeYtDlpArgsForLogs(args);
+  console.log(`[yt-dlp] command: yt-dlp ${sanitized.join(" ")}`);
+
+  const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  let finished = false;
+
+  const finalize = (code) => {
+    if (finished) return;
+    finished = true;
+    onClose(code, stderr);
+  };
+
+  proc.stderr.on("data", (d) => {
+    stderr += d.toString();
+  });
+  proc.on("error", (err) => {
+    stderr += `spawn error: ${err.message}`;
+    finalize(127);
+  });
+  proc.on("close", (code) => finalize(code ?? 1));
+}
+
 // Guarda arquivos gerados em memória (id -> meta)
 const files = new Map(); // id -> { filePath, createdAt, mime, filename }
 
@@ -73,18 +117,18 @@ app.post("/download", (req, res) => {
   const outTemplate = path.join(outDir, `pusclip-${id}.%(ext)s`);
 
   // Args yt-dlp
-  const args =
+  const baseArgs =
     want === "mp4"
       ? ["-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", outTemplate, url]
       : ["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
 
-  const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
+  const firstAttemptArgs = ["--js-runtimes", "node", ...baseArgs];
+  const fallbackRuntime = hasRenderNodePath ? `node:${RENDER_NODE_PATH}` : "node";
+  const shouldRetryWithFallback = fallbackRuntime !== "node";
 
-  let stderr = "";
-  proc.stderr.on("data", (d) => (stderr += d.toString()));
-
-  proc.on("close", (code) => {
+  const handleResult = (code, stderr) => {
     if (code !== 0) {
+      console.error("[yt-dlp] stderr (full):\n" + stderr);
       return res.status(500).json({
         error: "yt-dlp failed",
         code,
@@ -112,9 +156,29 @@ app.post("/download", (req, res) => {
       filename,
       downloadUrl: `/files/${id}`,
     });
+  };
+
+  runYtDlp(firstAttemptArgs, (code, stderr) => {
+    if (code === 0) return handleResult(code, stderr);
+
+    if (shouldRetryWithFallback && /No supported JavaScript runtime could be found/i.test(stderr)) {
+      console.warn(`[yt-dlp] retrying with fallback runtime: ${fallbackRuntime}`);
+      const fallbackArgs = ["--js-runtimes", fallbackRuntime, ...baseArgs];
+      return runYtDlp(fallbackArgs, handleResult);
+    }
+
+    return handleResult(code, stderr);
   });
+});
+
+app.use((err, _req, res, _next) => {
+  console.error("[express] unhandled error:", err);
+  if (res.headersSent) return;
+  res.status(500).json({ error: "Internal server error" });
 });
 
 app.listen(PORT, () => {
   console.log(`Downloader API listening on port ${PORT}`);
+  console.log(`[runtime] node: ${process.version}`);
+  runYtDlp(["--version"], () => {});
 });
