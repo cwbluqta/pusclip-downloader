@@ -117,10 +117,20 @@ app.post("/download", (req, res) => {
   const outTemplate = path.join(outDir, `pusclip-${id}.%(ext)s`);
 
   // Args yt-dlp
+  const commonArgs = [
+    "--no-playlist",
+    "--user-agent",
+    "Mozilla/5.0 (Linux; Android 11; Mobile)",
+    "--add-header",
+    "Referer: https://www.youtube.com/",
+    "--extractor-args",
+    "youtube:player_client=android",
+  ];
+
   const baseArgs =
     want === "mp4"
-      ? ["-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", outTemplate, url]
-      : ["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
+      ? [...commonArgs, "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", outTemplate, url]
+      : [...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
 
   const firstAttemptArgs = ["--js-runtimes", "node", ...baseArgs];
   const fallbackRuntime = hasRenderNodePath ? `node:${RENDER_NODE_PATH}` : "node";
