@@ -207,6 +207,7 @@ app.post("/transcribe", (req, res) => {
   };
 
   jobStore.set(jobId, job);
+  console.log("created job", jobId, "map size", jobStore.size);
 
   setTimeout(() => {
     const current = jobStore.get(jobId);
@@ -244,6 +245,7 @@ app.post("/transcribe", (req, res) => {
 
 app.get("/jobs/:jobId", (req, res) => {
   const { jobId } = req.params;
+  console.log("get job", jobId, "keys", Array.from(jobStore.keys()).slice(0, 5));
   const job = jobStore.get(jobId);
 
   if (!job) {
