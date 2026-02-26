@@ -58,6 +58,7 @@ function runYtDlp(args, onClose) {
 
 // Guarda arquivos gerados em memória (id -> meta)
 const files = new Map(); // id -> { filePath, createdAt, mime, filename }
+const jobStore = new Map(); // jobId -> transcribe job metadata
 
 // Limpa arquivos antigos (Render usa /tmp; não deixe acumular)
 setInterval(() => {
@@ -181,10 +182,105 @@ app.post("/download", (req, res) => {
   });
 });
 
+app.post("/transcribe", (req, res) => {
+  const { assetId } = req.body || {};
+
+  if (!assetId || typeof assetId !== "string") {
+    return res.status(400).json({
+      ok: false,
+      error: { code: "BAD_REQUEST", message: "Invalid JSON body" },
+    });
+  }
+
+  const nowIso = new Date().toISOString();
+  const jobId = crypto.randomUUID();
+  const job = {
+    jobId,
+    type: "transcribe",
+    status: "queued",
+    progress: 0,
+    assetId,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+    result: null,
+    error: null,
+  };
+
+  jobStore.set(jobId, job);
+
+  setTimeout(() => {
+    const current = jobStore.get(jobId);
+    if (!current) return;
+    current.status = "processing";
+    current.progress = 10;
+    current.updatedAt = new Date().toISOString();
+  }, 400);
+
+  setTimeout(() => {
+    const current = jobStore.get(jobId);
+    if (!current) return;
+    current.status = "processing";
+    current.progress = 60;
+    current.updatedAt = new Date().toISOString();
+  }, 1000);
+
+  setTimeout(() => {
+    const current = jobStore.get(jobId);
+    if (!current) return;
+    current.status = "done";
+    current.progress = 100;
+    current.result = { transcript: "" };
+    current.updatedAt = new Date().toISOString();
+  }, 1800);
+
+  return res.status(202).json({
+    ok: true,
+    jobId,
+    status: "queued",
+    assetId,
+    createdAt: nowIso,
+  });
+});
+
+app.get("/jobs/:jobId", (req, res) => {
+  const { jobId } = req.params;
+  const job = jobStore.get(jobId);
+
+  if (!job) {
+    return res.status(404).json({
+      ok: false,
+      error: { code: "NOT_FOUND", message: "Job not found" },
+    });
+  }
+
+  return res.status(200).json({
+    ok: true,
+    job,
+  });
+});
+
+app.use((_req, res) => {
+  res.status(404).json({
+    ok: false,
+    error: { code: "NOT_FOUND", message: "Route not found" },
+  });
+});
+
 app.use((err, _req, res, _next) => {
   console.error("[express] unhandled error:", err);
   if (res.headersSent) return;
-  res.status(500).json({ error: "Internal server error" });
+
+  if (err instanceof SyntaxError && "body" in err) {
+    return res.status(400).json({
+      ok: false,
+      error: { code: "BAD_REQUEST", message: "Invalid JSON body" },
+    });
+  }
+
+  return res.status(500).json({
+    ok: false,
+    error: { code: "INTERNAL", message: "Internal server error" },
+  });
 });
 
 app.listen(PORT, () => {
