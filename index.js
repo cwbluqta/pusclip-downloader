@@ -57,6 +57,23 @@ function runYtDlp(args, onClose) {
   proc.on("close", (code) => finalize(code ?? 1));
 }
 
+function isTranscriptEmpty(result) {
+  if (!result) return true;
+
+  const transcriptEmpty =
+    !result.transcript ||
+    result.transcript.trim().length === 0;
+
+  const segmentsEmpty =
+    !Array.isArray(result.segments) ||
+    result.segments.length === 0 ||
+    result.segments.every(
+      (s) => !s.text || s.text.trim().length === 0,
+    );
+
+  return transcriptEmpty && segmentsEmpty;
+}
+
 // Guarda arquivos gerados em memória (id -> meta)
 const files = new Map(); // id -> { filePath, createdAt, mime, filename }
 
@@ -231,14 +248,33 @@ app.post("/transcribe", async (req, res) => {
 
   setTimeout(async () => {
     try {
+      const transcriptionResult = {
+        transcript: typeof payload.transcript === "string" ? payload.transcript : "",
+        segments: Array.isArray(payload.segments) ? payload.segments : [],
+        language: payload.language ?? null,
+      };
+
+      if (isTranscriptEmpty(transcriptionResult)) {
+        await patchJob(jobId, {
+          status: "error",
+          error: {
+            code: "TRANSCRIPT_EMPTY",
+            message: "Transcription returned empty content",
+          },
+          updatedAt: Date.now(),
+        });
+        console.warn("job status transition", jobId, "-> error (TRANSCRIPT_EMPTY)");
+        return;
+      }
+
       const updated = await patchJob(jobId, {
         status: "done",
         progress: { stage: "done", pct: 100 },
         result: {
           transcript: {
-            text: "",
-            segments: [],
-            language: null,
+            text: transcriptionResult.transcript,
+            segments: transcriptionResult.segments,
+            language: transcriptionResult.language,
           },
         },
         error: null,

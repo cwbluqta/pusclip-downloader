@@ -31,6 +31,26 @@ export async function patchJob(jobId, patch) {
   const current = await getJob(jobId);
   if (!current) return null;
 
+  const currentStatus = current.status;
+  if (currentStatus === "done" || currentStatus === "error") {
+    return null;
+  }
+
+  const nextStatus = patch?.status ?? currentStatus;
+  const allowedTransitions = {
+    queued: new Set(["queued", "processing", "error"]),
+    processing: new Set(["processing", "done", "error"]),
+  };
+
+  if (
+    currentStatus &&
+    nextStatus &&
+    allowedTransitions[currentStatus] &&
+    !allowedTransitions[currentStatus].has(nextStatus)
+  ) {
+    return null;
+  }
+
   const next = {
     ...current,
     ...patch,
