@@ -4,6 +4,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { spawn } from "child_process";
+import { redis } from "./redis.js";
 
 const app = express();
 
@@ -259,6 +260,18 @@ app.get("/jobs/:jobId", (req, res) => {
     ok: true,
     job,
   });
+});
+
+app.get("/health/redis", async (_req, res) => {
+  try {
+    await redis.ping();
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: { message: String(err?.message ?? err) },
+    });
+  }
 });
 
 app.use((_req, res) => {
