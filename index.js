@@ -57,21 +57,32 @@ function runYtDlp(args, onClose) {
   proc.on("close", (code) => finalize(code ?? 1));
 }
 
-function isTranscriptEmpty(result) {
-  if (!result) return true;
+function isTranscriptEmpty(payload) {
+  if (!payload) return true;
 
-  const transcriptEmpty =
-    !result.transcript ||
-    result.transcript.trim().length === 0;
+  // shape B (stored)
+  const tObj = payload.transcript && typeof payload.transcript === "object"
+    ? payload.transcript
+    : null;
 
-  const segmentsEmpty =
-    !Array.isArray(result.segments) ||
-    result.segments.length === 0 ||
-    result.segments.every(
-      (s) => !s.text || s.text.trim().length === 0,
-    );
+  const textB = tObj ? (tObj.text ?? "") : "";
+  const segB = tObj ? (tObj.segments ?? []) : null;
 
-  return transcriptEmpty && segmentsEmpty;
+  // shape A (raw)
+  const textA = typeof payload.transcript === "string" ? payload.transcript : "";
+  const segA = Array.isArray(payload.segments) ? payload.segments : null;
+
+  const text = (textB || textA || "");
+  const segs = (Array.isArray(segB) ? segB : (Array.isArray(segA) ? segA : []));
+
+  const textEmpty = text.trim().length === 0;
+  const segsEmpty = !Array.isArray(segs) || segs.length === 0 || segs.every((s) => {
+    const st = typeof s === "string" ? s : (s?.text ?? "");
+    return String(st).trim().length === 0;
+  });
+
+  // treat as empty if BOTH text and segs are empty
+  return textEmpty && segsEmpty;
 }
 
 // Guarda arquivos gerados em memória (id -> meta)
@@ -248,19 +259,22 @@ app.post("/transcribe", async (req, res) => {
 
   setTimeout(async () => {
     try {
-      const transcriptionResult = {
-        transcript: typeof payload.transcript === "string" ? payload.transcript : "",
-        segments: Array.isArray(payload.segments) ? payload.segments : [],
-        language: payload.language ?? null,
+      const finalResult = {
+        transcript: {
+          text: typeof payload.transcript === "string" ? payload.transcript : "",
+          segments: Array.isArray(payload.segments) ? payload.segments : [],
+          language: payload.language ?? null,
+        },
       };
 
-      if (isTranscriptEmpty(transcriptionResult)) {
+      if (isTranscriptEmpty(finalResult)) {
         await patchJob(jobId, {
           status: "error",
           error: {
             code: "TRANSCRIPT_EMPTY",
             message: "Transcription returned empty content",
           },
+          progress: { stage: "error", pct: 100 },
           updatedAt: Date.now(),
         });
         console.warn("job status transition", jobId, "-> error (TRANSCRIPT_EMPTY)");
@@ -270,13 +284,7 @@ app.post("/transcribe", async (req, res) => {
       const updated = await patchJob(jobId, {
         status: "done",
         progress: { stage: "done", pct: 100 },
-        result: {
-          transcript: {
-            text: transcriptionResult.transcript,
-            segments: transcriptionResult.segments,
-            language: transcriptionResult.language,
-          },
-        },
+        result: finalResult,
         error: null,
       });
       if (updated) console.log("job status transition", jobId, "-> done");
