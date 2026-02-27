@@ -4,7 +4,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { spawn } from "child_process";
-import { redis } from "./redis.js";
+import { getJob, patchJob, redis, setJob } from "./redis.js";
 
 const app = express();
 
@@ -59,7 +59,6 @@ function runYtDlp(args, onClose) {
 
 // Guarda arquivos gerados em memória (id -> meta)
 const files = new Map(); // id -> { filePath, createdAt, mime, filename }
-const jobStore = new Map(); // jobId -> transcribe job metadata
 
 // Limpa arquivos antigos (Render usa /tmp; não deixe acumular)
 setInterval(() => {
@@ -183,76 +182,92 @@ app.post("/download", (req, res) => {
   });
 });
 
-app.post("/transcribe", (req, res) => {
-  const { assetId } = req.body || {};
+app.post("/transcribe", async (req, res) => {
+  const payload = req.body || {};
+  const { url } = payload;
 
-  if (!assetId || typeof assetId !== "string") {
+  if (!url || typeof url !== "string") {
     return res.status(400).json({
       ok: false,
       error: { code: "BAD_REQUEST", message: "Invalid JSON body" },
     });
   }
 
-  const nowIso = new Date().toISOString();
+  const now = Date.now();
   const jobId = crypto.randomUUID();
   const job = {
     jobId,
     type: "transcribe",
     status: "queued",
-    progress: 0,
-    assetId,
-    createdAt: nowIso,
-    updatedAt: nowIso,
-    result: null,
+    createdAt: now,
+    updatedAt: now,
+    input: payload,
+    progress: { stage: "queued", pct: 0 },
+    result: {
+      transcript: { text: null, segments: null, language: null },
+    },
     error: null,
   };
 
-  jobStore.set(jobId, job);
-  console.log("created job", jobId, "map size", jobStore.size);
+  await setJob(jobId, job);
+  console.log("created job", jobId, "status=queued");
 
-  setTimeout(() => {
-    const current = jobStore.get(jobId);
-    if (!current) return;
-    current.status = "processing";
-    current.progress = 10;
-    current.updatedAt = new Date().toISOString();
+  setTimeout(async () => {
+    try {
+      const updated = await patchJob(jobId, {
+        status: "processing",
+        progress: { stage: "transcribing", pct: 10 },
+      });
+      if (updated) console.log("job status transition", jobId, "-> processing");
+    } catch (err) {
+      const message = String(err?.message ?? err);
+      await patchJob(jobId, {
+        status: "error",
+        error: { code: "TRANSCRIBE_FAILED", message },
+      });
+      console.error("job failed", jobId, message);
+    }
   }, 400);
 
-  setTimeout(() => {
-    const current = jobStore.get(jobId);
-    if (!current) return;
-    current.status = "processing";
-    current.progress = 60;
-    current.updatedAt = new Date().toISOString();
-  }, 1000);
-
-  setTimeout(() => {
-    const current = jobStore.get(jobId);
-    if (!current) return;
-    current.status = "done";
-    current.progress = 100;
-    current.result = { transcript: "" };
-    current.updatedAt = new Date().toISOString();
+  setTimeout(async () => {
+    try {
+      const updated = await patchJob(jobId, {
+        status: "done",
+        progress: { stage: "done", pct: 100 },
+        result: {
+          transcript: {
+            text: "",
+            segments: [],
+            language: null,
+          },
+        },
+        error: null,
+      });
+      if (updated) console.log("job status transition", jobId, "-> done");
+    } catch (err) {
+      const message = String(err?.message ?? err);
+      await patchJob(jobId, {
+        status: "error",
+        error: { code: "TRANSCRIBE_FAILED", message },
+      });
+      console.error("job failed", jobId, message);
+    }
   }, 1800);
 
   return res.status(202).json({
     ok: true,
     jobId,
-    status: "queued",
-    assetId,
-    createdAt: nowIso,
   });
 });
 
-app.get("/jobs/:jobId", (req, res) => {
+app.get("/jobs/:jobId", async (req, res) => {
   const { jobId } = req.params;
-  console.log("get job", jobId, "keys", Array.from(jobStore.keys()).slice(0, 5));
-  const job = jobStore.get(jobId);
+  const job = await getJob(jobId);
 
   if (!job) {
     return res.status(404).json({
       ok: false,
-      error: { code: "NOT_FOUND", message: "Job not found" },
+      error: { code: "JOB_NOT_FOUND", message: "Job not found" },
     });
   }
 
