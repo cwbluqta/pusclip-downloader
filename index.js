@@ -69,6 +69,30 @@ function runYtDlpAsync(args) {
   });
 }
 
+function classifyDownloadError(stderr) {
+  const normalized = String(stderr || "").toLowerCase();
+  const authRequiredPatterns = [
+    "sign in to confirm you're not a bot",
+    "--cookies-from-browser",
+    "--cookies",
+    "unable to extract yt initial data",
+  ];
+
+  const isAuthRequired = authRequiredPatterns.some((pattern) => normalized.includes(pattern));
+
+  if (isAuthRequired) {
+    return {
+      code: "YOUTUBE_AUTH_REQUIRED",
+      message: "YouTube blocked automated download for this video",
+    };
+  }
+
+  return {
+    code: "DOWNLOAD_FAILED",
+    message: (String(stderr || "").slice(-1500) || "yt-dlp failed"),
+  };
+}
+
 
 
 function jsonError(res, status, code, message) {
@@ -103,8 +127,9 @@ async function downloadMediaForTranscription(url, outputId) {
   }
 
   if (code !== 0) {
-    const err = new Error(stderr.slice(-1500) || "yt-dlp failed");
-    err.code = "DOWNLOAD_FAILED";
+    const classifiedError = classifyDownloadError(stderr);
+    const err = new Error(classifiedError.message);
+    err.code = classifiedError.code;
     throw err;
   }
 
