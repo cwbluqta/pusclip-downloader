@@ -5,6 +5,7 @@ import path from "path";
 import crypto from "crypto";
 import { spawn } from "child_process";
 import { getJob, patchJob, redis, setJob } from "./redis.js";
+import { buildClipCandidates, getSourceTranscriptSegments } from "./analysis.js";
 
 const app = express();
 
@@ -57,6 +58,66 @@ function runYtDlp(args, onClose) {
   proc.on("close", (code) => finalize(code ?? 1));
 }
 
+
+
+function jsonError(res, status, code, message) {
+  return res.status(status).json({
+    ok: false,
+    error: { code, message },
+  });
+}
+
+async function processAnalyzeJob(jobId) {
+  try {
+    const processing = await patchJob(jobId, {
+      status: "processing",
+      progress: { stage: "analyzing", pct: 15 },
+    });
+
+    if (!processing) return;
+
+    const sourceJobId = processing?.input?.sourceJobId;
+    const sourceJob = await getJob(sourceJobId);
+
+    if (!sourceJob || sourceJob.type !== "transcribe" || sourceJob.status !== "done") {
+      await patchJob(jobId, {
+        status: "error",
+        progress: { stage: "error", pct: 100 },
+        error: {
+          code: "SOURCE_JOB_NOT_READY",
+          message: "Source transcription job is not completed",
+        },
+      });
+      return;
+    }
+
+    const sourceSegments = getSourceTranscriptSegments(sourceJob);
+    const clips = buildClipCandidates(sourceSegments);
+
+    if (!clips.length) {
+      await patchJob(jobId, {
+        status: "error",
+        progress: { stage: "error", pct: 100 },
+        error: { code: "NO_CLIPS_FOUND", message: "No valid clip candidates found" },
+      });
+      return;
+    }
+
+    await patchJob(jobId, {
+      status: "done",
+      progress: { stage: "done", pct: 100 },
+      result: { clips },
+      error: null,
+    });
+  } catch (err) {
+    const message = String(err?.message ?? err);
+    await patchJob(jobId, {
+      status: "error",
+      progress: { stage: "error", pct: 100 },
+      error: { code: "ANALYZE_FAILED", message },
+    });
+  }
+}
 function isTranscriptEmpty(payload) {
   if (!payload) return true;
 
@@ -297,6 +358,60 @@ app.post("/transcribe", async (req, res) => {
       console.error("job failed", jobId, message);
     }
   }, 1800);
+
+  return res.status(202).json({
+    ok: true,
+    jobId,
+  });
+});
+
+
+app.post("/analyze", async (req, res) => {
+  const { sourceJobId } = req.body || {};
+
+  if (!sourceJobId || typeof sourceJobId !== "string") {
+    return jsonError(res, 400, "INVALID_INPUT", "sourceJobId is required");
+  }
+
+  const sourceJob = await getJob(sourceJobId);
+
+  if (!sourceJob) {
+    return jsonError(res, 404, "SOURCE_JOB_NOT_FOUND", "Source transcription job not found");
+  }
+
+  if (sourceJob.type !== "transcribe" || sourceJob.status !== "done") {
+    return jsonError(res, 409, "SOURCE_JOB_NOT_READY", "Source transcription job is not completed");
+  }
+
+  const sourceSegments = getSourceTranscriptSegments(sourceJob);
+  const hasUsableSegments = Array.isArray(sourceSegments)
+    && sourceSegments.some((segment) => String(segment?.text ?? "").trim().length > 0);
+
+  if (!hasUsableSegments) {
+    return jsonError(res, 422, "SOURCE_TRANSCRIPT_EMPTY", "Source transcription has no usable segments");
+  }
+
+  const now = Date.now();
+  const jobId = crypto.randomUUID();
+  const analyzeJob = {
+    jobId,
+    type: "analyze",
+    status: "queued",
+    createdAt: now,
+    updatedAt: now,
+    input: { sourceJobId },
+    progress: { stage: "queued", pct: 0 },
+    result: null,
+    error: null,
+  };
+
+  await setJob(jobId, analyzeJob);
+
+  setTimeout(() => {
+    processAnalyzeJob(jobId).catch((err) => {
+      console.error("analyze processor failed", jobId, err);
+    });
+  }, 0);
 
   return res.status(202).json({
     ok: true,
