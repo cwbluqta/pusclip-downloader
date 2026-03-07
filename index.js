@@ -6,6 +6,11 @@ import crypto from "crypto";
 import { spawn } from "child_process";
 import { getJob, patchJob, redis, setJob } from "./redis.js";
 import { buildClipCandidates, getSourceTranscriptSegments } from "./analysis.js";
+import {
+  getTranscriptionProviderName,
+  isTranscriptionProviderConfigured,
+  transcribeAudioFile,
+} from "./transcribe.js";
 
 const app = express();
 
@@ -58,6 +63,12 @@ function runYtDlp(args, onClose) {
   proc.on("close", (code) => finalize(code ?? 1));
 }
 
+function runYtDlpAsync(args) {
+  return new Promise((resolve) => {
+    runYtDlp(args, (code, stderr) => resolve({ code, stderr }));
+  });
+}
+
 
 
 function jsonError(res, status, code, message) {
@@ -65,6 +76,50 @@ function jsonError(res, status, code, message) {
     ok: false,
     error: { code, message },
   });
+}
+
+async function downloadMediaForTranscription(url, outputId) {
+  const outDir = "/tmp";
+  const outTemplate = path.join(outDir, `pusclip-transcribe-${outputId}.%(ext)s`);
+  const commonArgs = [
+    "--no-playlist",
+    "--user-agent",
+    "Mozilla/5.0 (Linux; Android 11; Mobile)",
+    "--add-header",
+    "Referer: https://www.youtube.com/",
+    "--extractor-args",
+    "youtube:player_client=android",
+  ];
+
+  const baseArgs = [...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
+  const firstAttemptArgs = ["--js-runtimes", "node", ...baseArgs];
+  const fallbackRuntime = hasRenderNodePath ? `node:${RENDER_NODE_PATH}` : "node";
+
+  let { code, stderr } = await runYtDlpAsync(firstAttemptArgs);
+
+  if (code !== 0 && fallbackRuntime !== "node" && /No supported JavaScript runtime could be found/i.test(stderr)) {
+    console.warn(`[yt-dlp] retrying with fallback runtime: ${fallbackRuntime}`);
+    ({ code, stderr } = await runYtDlpAsync(["--js-runtimes", fallbackRuntime, ...baseArgs]));
+  }
+
+  if (code !== 0) {
+    const err = new Error(stderr.slice(-1500) || "yt-dlp failed");
+    err.code = "DOWNLOAD_FAILED";
+    throw err;
+  }
+
+  const candidates = ["mp3", "m4a", "webm", "mp4"];
+  const filePath = candidates
+    .map((ext) => path.join(outDir, `pusclip-transcribe-${outputId}.${ext}`))
+    .find((candidatePath) => fs.existsSync(candidatePath));
+
+  if (!filePath) {
+    const err = new Error("download finished but file not found");
+    err.code = "DOWNLOAD_OUTPUT_NOT_FOUND";
+    throw err;
+  }
+
+  return filePath;
 }
 
 async function processAnalyzeJob(jobId) {
@@ -301,6 +356,17 @@ app.post("/transcribe", async (req, res) => {
   await setJob(jobId, job);
   console.log("created job", jobId, "status=queued");
 
+  if (!isTranscriptionProviderConfigured()) {
+    await patchJob(jobId, {
+      status: "error",
+      progress: { stage: "error", pct: 100 },
+      error: {
+        code: "TRANSCRIPTION_PROVIDER_NOT_CONFIGURED",
+        message: "Transcription provider is not configured",
+      },
+    });
+  }
+
   setTimeout(async () => {
     try {
       const updated = await patchJob(jobId, {
@@ -310,22 +376,25 @@ app.post("/transcribe", async (req, res) => {
       if (updated) console.log("job status transition", jobId, "-> processing");
     } catch (err) {
       const message = String(err?.message ?? err);
+      const errorCode = typeof err?.code === "string" ? err.code : "TRANSCRIBE_FAILED";
       await patchJob(jobId, {
         status: "error",
-        error: { code: "TRANSCRIBE_FAILED", message },
+        progress: { stage: "error", pct: 100 },
+        error: { code: errorCode, message },
       });
       console.error("job failed", jobId, message);
     }
   }, 400);
 
   setTimeout(async () => {
+    let downloadedFilePath = null;
+
     try {
+      downloadedFilePath = await downloadMediaForTranscription(url, jobId);
+      const transcript = await transcribeAudioFile(downloadedFilePath);
+
       const finalResult = {
-        transcript: {
-          text: typeof payload.transcript === "string" ? payload.transcript : "",
-          segments: Array.isArray(payload.segments) ? payload.segments : [],
-          language: payload.language ?? null,
-        },
+        transcript,
       };
 
       if (isTranscriptEmpty(finalResult)) {
@@ -336,7 +405,6 @@ app.post("/transcribe", async (req, res) => {
             message: "Transcription returned empty content",
           },
           progress: { stage: "error", pct: 100 },
-          updatedAt: Date.now(),
         });
         console.warn("job status transition", jobId, "-> error (TRANSCRIPT_EMPTY)");
         return;
@@ -351,11 +419,19 @@ app.post("/transcribe", async (req, res) => {
       if (updated) console.log("job status transition", jobId, "-> done");
     } catch (err) {
       const message = String(err?.message ?? err);
+      const errorCode = typeof err?.code === "string" ? err.code : "TRANSCRIBE_FAILED";
       await patchJob(jobId, {
         status: "error",
-        error: { code: "TRANSCRIBE_FAILED", message },
+        progress: { stage: "error", pct: 100 },
+        error: { code: errorCode, message },
       });
       console.error("job failed", jobId, message);
+    } finally {
+      if (downloadedFilePath) {
+        try {
+          fs.unlinkSync(downloadedFilePath);
+        } catch {}
+      }
     }
   }, 1800);
 
@@ -475,5 +551,8 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`Downloader API listening on port ${PORT}`);
   console.log(`[runtime] node: ${process.version}`);
+  if (!getTranscriptionProviderName()) {
+    console.warn("[transcribe] OPENAI_API_KEY is not set. /transcribe jobs will fail with TRANSCRIPTION_PROVIDER_NOT_CONFIGURED");
+  }
   runYtDlp(["--version"], () => {});
 });
