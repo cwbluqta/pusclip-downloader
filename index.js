@@ -23,11 +23,23 @@ const RENDER_NODE_PATH = "/usr/bin/node";
 const COOKIES_PATH = path.resolve(process.cwd(), "cookies.txt");
 const hasRenderNodePath = fs.existsSync(RENDER_NODE_PATH);
 
-function getYtDlpBaseArgs() {
-  if (!fs.existsSync(COOKIES_PATH)) {
-    throw new Error(`cookies.txt not found at ${COOKIES_PATH}`);
+function ensureCookiesFile() {
+  if (fs.existsSync(COOKIES_PATH)) {
+    return COOKIES_PATH;
   }
-  return ["--cookies", COOKIES_PATH];
+
+  const envCookies = process.env.YTDLP_COOKIES;
+  if (envCookies) {
+    fs.writeFileSync(COOKIES_PATH, envCookies, "utf8");
+    return COOKIES_PATH;
+  }
+
+  throw new Error(`YTDLP_COOKIES not configured and cookies.txt not found at ${COOKIES_PATH}`);
+}
+
+function getYtDlpBaseArgs() {
+  const cookiePath = ensureCookiesFile();
+  return ["--cookies", cookiePath];
 }
 
 function sanitizeUrlForLogs(raw) {
