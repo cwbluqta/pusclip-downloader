@@ -20,7 +20,15 @@ app.use(express.json({ limit: "2mb" }));
 const { PORT = 3000, DOWNLOADER_TOKEN } = process.env;
 
 const RENDER_NODE_PATH = "/usr/bin/node";
+const COOKIES_PATH = path.resolve(process.cwd(), "cookies.txt");
 const hasRenderNodePath = fs.existsSync(RENDER_NODE_PATH);
+
+function getYtDlpBaseArgs() {
+  if (!fs.existsSync(COOKIES_PATH)) {
+    throw new Error(`cookies.txt not found at ${COOKIES_PATH}`);
+  }
+  return ["--cookies", COOKIES_PATH];
+}
 
 function sanitizeUrlForLogs(raw) {
   try {
@@ -115,7 +123,7 @@ async function downloadMediaForTranscription(url, outputId) {
     "youtube:player_client=android",
   ];
 
-  const baseArgs = [...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
+  const baseArgs = [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
   const firstAttemptArgs = ["--js-runtimes", "node", ...baseArgs];
   const fallbackRuntime = hasRenderNodePath ? `node:${RENDER_NODE_PATH}` : "node";
 
@@ -299,8 +307,8 @@ app.post("/download", (req, res) => {
 
   const baseArgs =
     want === "mp4"
-      ? [...commonArgs, "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", outTemplate, url]
-      : [...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
+      ? [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", outTemplate, url]
+      : [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
 
   const firstAttemptArgs = ["--js-runtimes", "node", ...baseArgs];
   const fallbackRuntime = hasRenderNodePath ? `node:${RENDER_NODE_PATH}` : "node";
@@ -579,5 +587,5 @@ app.listen(PORT, () => {
   if (!getTranscriptionProviderName()) {
     console.warn("[transcribe] OPENAI_API_KEY is not set. /transcribe jobs will fail with TRANSCRIPTION_PROVIDER_NOT_CONFIGURED");
   }
-  runYtDlp(["--version"], () => {});
+  runYtDlp([...getYtDlpBaseArgs(), "--version"], () => {});
 });
