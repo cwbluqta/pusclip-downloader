@@ -4,7 +4,8 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { spawn } from "child_process";
-import { getJob, patchJob, redis, setJob } from "./redis.js";
+import { generateVideoClip, getMediaDurationMs } from "./ffmpeg.js";
+import { appendJobLog, getJob, patchJob, redis, setJob } from "./redis.js";
 import { buildClipCandidates, getSourceTranscriptSegments } from "./analysis.js";
 import {
   getTranscriptionProviderName,
@@ -21,7 +22,12 @@ const { PORT = 3000, DOWNLOADER_TOKEN } = process.env;
 
 const RENDER_NODE_PATH = "/usr/bin/node";
 const COOKIES_PATH = path.resolve(process.cwd(), "cookies.txt");
+const JOB_OUTPUT_ROOT = path.join("/tmp", "pusclip-jobs");
 const hasRenderNodePath = fs.existsSync(RENDER_NODE_PATH);
+const CLIP_JOB_MIN_COUNT = 1;
+const CLIP_JOB_MAX_COUNT = 10;
+const CLIP_MIN_DURATION_MS = 3000;
+const CLIP_MAX_DURATION_MS = 120000;
 
 function ensureCookiesFile() {
   if (fs.existsSync(COOKIES_PATH)) {
@@ -122,6 +128,141 @@ function jsonError(res, status, code, message) {
   });
 }
 
+function clipsJsonError(res, status, code, details) {
+  return res.status(status).json({
+    ok: false,
+    error: code,
+    details,
+  });
+}
+
+function createJobId(prefix = "job") {
+  return `${prefix}_${crypto.randomBytes(12).toString("hex")}`;
+}
+
+function ensureDirSync(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+  return dirPath;
+}
+
+function getClipJobOutputDir(jobId) {
+  return path.join(JOB_OUTPUT_ROOT, jobId);
+}
+
+function isFiniteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isSafeClipId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]+$/.test(value);
+}
+
+function findSourceVideoFilePath(job) {
+  const candidatePaths = [
+    job?.result?.video?.filePath,
+    job?.result?.sourceVideo?.filePath,
+    job?.result?.filePath,
+    job?.filePath,
+  ];
+
+  return candidatePaths.find((candidatePath) => typeof candidatePath === "string" && candidatePath.trim().length > 0) ?? null;
+}
+
+async function addJobLog(jobId, message, level = "info") {
+  return appendJobLog(jobId, {
+    at: Date.now(),
+    level,
+    message,
+  });
+}
+
+function buildClipJobResult(sourceJobId, outputDir, manifestPath) {
+  return {
+    sourceJobId,
+    outputDir,
+    manifestPath,
+    clips: [],
+  };
+}
+
+function validateClipRequestBody(body) {
+  const { sourceJobId, clips } = body || {};
+
+  if (!sourceJobId || typeof sourceJobId !== "string") {
+    return { ok: false, status: 400, error: "INVALID_SOURCE_JOB_ID", details: "sourceJobId is required" };
+  }
+
+  if (!Array.isArray(clips)) {
+    return { ok: false, status: 400, error: "INVALID_CLIPS", details: "clips is required and must be an array" };
+  }
+
+  if (clips.length < CLIP_JOB_MIN_COUNT || clips.length > CLIP_JOB_MAX_COUNT) {
+    return {
+      ok: false,
+      status: 400,
+      error: "INVALID_CLIP_COUNT",
+      details: `clips must contain between ${CLIP_JOB_MIN_COUNT} and ${CLIP_JOB_MAX_COUNT} items`,
+    };
+  }
+
+  const seenClipIds = new Set();
+
+  for (const [index, clip] of clips.entries()) {
+    if (!clip || typeof clip !== "object") {
+      return { ok: false, status: 400, error: "INVALID_CLIP", details: `clips[${index}] must be an object` };
+    }
+
+    if (!clip.clipId || typeof clip.clipId !== "string") {
+      return { ok: false, status: 400, error: "INVALID_CLIP_ID", details: `clips[${index}].clipId is required` };
+    }
+
+    if (!isSafeClipId(clip.clipId)) {
+      return {
+        ok: false,
+        status: 400,
+        error: "INVALID_CLIP_ID",
+        details: `clips[${index}].clipId must match /^[A-Za-z0-9_-]+$/`,
+      };
+    }
+
+    if (seenClipIds.has(clip.clipId)) {
+      return { ok: false, status: 400, error: "DUPLICATE_CLIP_ID", details: `clips[${index}].clipId must be unique` };
+    }
+
+    seenClipIds.add(clip.clipId);
+
+    if (!isFiniteNumber(clip.startMs) || clip.startMs < 0) {
+      return { ok: false, status: 400, error: "INVALID_CLIP_START", details: `clips[${index}].startMs must be a number >= 0` };
+    }
+
+    if (!isFiniteNumber(clip.endMs) || clip.endMs <= clip.startMs) {
+      return { ok: false, status: 400, error: "INVALID_CLIP_END", details: `clips[${index}].endMs must be greater than startMs` };
+    }
+
+    const durationMs = clip.endMs - clip.startMs;
+
+    if (durationMs < CLIP_MIN_DURATION_MS) {
+      return {
+        ok: false,
+        status: 400,
+        error: "CLIP_DURATION_TOO_SHORT",
+        details: `clips[${index}] duration must be at least ${CLIP_MIN_DURATION_MS} ms`,
+      };
+    }
+
+    if (durationMs > CLIP_MAX_DURATION_MS) {
+      return {
+        ok: false,
+        status: 400,
+        error: "CLIP_DURATION_TOO_LONG",
+        details: `clips[${index}] duration must be at most ${CLIP_MAX_DURATION_MS} ms`,
+      };
+    }
+  }
+
+  return { ok: true, value: { sourceJobId, clips } };
+}
+
 async function downloadMediaForTranscription(url, outputId) {
   const outDir = "/tmp";
   const outTemplate = path.join(outDir, `pusclip-transcribe-${outputId}.%(ext)s`);
@@ -218,6 +359,218 @@ async function processAnalyzeJob(jobId) {
     });
   }
 }
+
+async function processClipJob(jobId) {
+  let outputDir = null;
+  let manifestPath = null;
+
+  try {
+    const queuedJob = await getJob(jobId);
+    if (!queuedJob) return;
+
+    const sourceJobId = queuedJob?.input?.sourceJobId;
+    const requestedClips = Array.isArray(queuedJob?.input?.clips) ? queuedJob.input.clips : [];
+    const sourceJob = await getJob(sourceJobId);
+
+    if (!sourceJob) {
+      await addJobLog(jobId, `source job ${sourceJobId} was not found`, "error");
+      await patchJob(jobId, {
+        status: "error",
+        progress: {
+          total: requestedClips.length,
+          completed: 0,
+          currentClipId: null,
+        },
+        error: {
+          code: "SOURCE_JOB_NOT_FOUND",
+          message: "Source video job does not exist",
+        },
+      });
+      return;
+    }
+
+    if (sourceJob.status !== "done") {
+      await addJobLog(jobId, `source job ${sourceJobId} is not available in done state`, "error");
+      await patchJob(jobId, {
+        status: "error",
+        progress: {
+          total: requestedClips.length,
+          completed: 0,
+          currentClipId: null,
+        },
+        error: {
+          code: "SOURCE_JOB_NOT_READY",
+          message: "Source video job does not exist or is not completed",
+        },
+      });
+      return;
+    }
+
+    const sourceVideoPath = findSourceVideoFilePath(sourceJob);
+
+    if (!sourceVideoPath || !fs.existsSync(sourceVideoPath)) {
+      await addJobLog(jobId, `source job ${sourceJobId} is missing a usable video file path`, "error");
+      await patchJob(jobId, {
+        status: "error",
+        progress: {
+          total: requestedClips.length,
+          completed: 0,
+          currentClipId: null,
+        },
+        error: {
+          code: "SOURCE_VIDEO_FILE_MISSING",
+          message: "Source video file path is missing",
+        },
+      });
+      return;
+    }
+
+    const sourceDurationMs = await getMediaDurationMs(sourceVideoPath);
+
+    const clipExceedingDuration = requestedClips.find((clip) => clip.endMs > sourceDurationMs);
+    if (clipExceedingDuration) {
+      await addJobLog(jobId, `clip ${clipExceedingDuration.clipId} exceeds source duration ${sourceDurationMs} ms`, "error");
+      await patchJob(jobId, {
+        status: "error",
+        progress: {
+          total: requestedClips.length,
+          completed: 0,
+          currentClipId: null,
+        },
+        error: {
+          code: "CLIP_EXCEEDS_SOURCE_DURATION",
+          message: "One or more clips exceed the source video duration",
+        },
+      });
+      return;
+    }
+
+    outputDir = ensureDirSync(getClipJobOutputDir(jobId));
+    manifestPath = path.join(outputDir, "manifest.json");
+
+    const updated = await patchJob(jobId, {
+      status: "processing",
+      progress: {
+        total: requestedClips.length,
+        completed: 0,
+        currentClipId: null,
+      },
+      result: buildClipJobResult(sourceJobId, outputDir, manifestPath),
+      error: null,
+    });
+
+    if (!updated) return;
+
+    await addJobLog(jobId, `clip job started with ${requestedClips.length} clip(s) from source job ${sourceJobId}`);
+
+    const generatedClips = [];
+
+    for (const [index, clip] of requestedClips.entries()) {
+      const fileName = `${clip.clipId}.mp4`;
+      const outputPath = path.join(outputDir, fileName);
+
+      await patchJob(jobId, {
+        progress: {
+          total: requestedClips.length,
+          completed: generatedClips.length,
+          currentClipId: clip.clipId,
+        },
+      });
+
+      await addJobLog(
+        jobId,
+        `generating clip ${clip.clipId} (${index + 1}/${requestedClips.length}) from ${clip.startMs}ms to ${clip.endMs}ms`,
+      );
+
+      await generateVideoClip({
+        inputPath: sourceVideoPath,
+        outputPath,
+        startMs: clip.startMs,
+        endMs: clip.endMs,
+      });
+
+      const clipResult = {
+        clipId: clip.clipId,
+        status: "done",
+        fileName,
+        durationMs: clip.endMs - clip.startMs,
+      };
+
+      generatedClips.push(clipResult);
+
+      await patchJob(jobId, {
+        progress: {
+          total: requestedClips.length,
+          completed: generatedClips.length,
+          currentClipId: clip.clipId,
+        },
+        result: {
+          sourceJobId,
+          outputDir,
+          manifestPath,
+          clips: generatedClips,
+        },
+      });
+
+      await addJobLog(jobId, `clip ${clip.clipId} completed`);
+    }
+
+    const manifest = {
+      sourceJobId,
+      generatedAt: Date.now(),
+      clips: generatedClips,
+    };
+
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+    await patchJob(jobId, {
+      status: "done",
+      progress: {
+        total: requestedClips.length,
+        completed: generatedClips.length,
+        currentClipId: null,
+      },
+      result: {
+        sourceJobId,
+        outputDir,
+        manifestPath,
+        clips: generatedClips,
+      },
+      error: null,
+    });
+
+    await addJobLog(jobId, `clip job completed successfully with ${generatedClips.length} clip(s)`);
+  } catch (err) {
+    const message = String(err?.message ?? err);
+    await addJobLog(jobId, `clip job failed: ${message}`, "error");
+    await patchJob(jobId, {
+      status: "error",
+      progress: {
+        ...(await getJob(jobId))?.progress,
+        currentClipId: null,
+      },
+      error: {
+        code: typeof err?.code === "string" ? err.code : "CLIP_JOB_FAILED",
+        message,
+      },
+    });
+
+    if (manifestPath && outputDir) {
+      const currentJob = await getJob(jobId);
+      const generatedClips = Array.isArray(currentJob?.result?.clips) ? currentJob.result.clips : [];
+      fs.writeFileSync(manifestPath, JSON.stringify({
+        sourceJobId: currentJob?.input?.sourceJobId ?? null,
+        generatedAt: Date.now(),
+        clips: generatedClips,
+        error: {
+          code: typeof err?.code === "string" ? err.code : "CLIP_JOB_FAILED",
+          message,
+        },
+      }, null, 2));
+    }
+  }
+}
+
 function isTranscriptEmpty(payload) {
   if (!payload) return true;
 
@@ -537,6 +890,93 @@ app.post("/analyze", async (req, res) => {
   return res.status(202).json({
     ok: true,
     jobId,
+  });
+});
+
+app.post("/clips", async (req, res) => {
+  const validation = validateClipRequestBody(req.body);
+  if (!validation.ok) {
+    return clipsJsonError(res, validation.status, validation.error, validation.details);
+  }
+
+  const { sourceJobId, clips } = validation.value;
+  const sourceJob = await getJob(sourceJobId);
+
+  if (!sourceJob) {
+    return clipsJsonError(res, 404, "SOURCE_JOB_NOT_FOUND", "Source video job does not exist");
+  }
+
+  if (sourceJob.status !== "done") {
+    return clipsJsonError(res, 409, "SOURCE_JOB_NOT_READY", "Source video job does not exist or is not completed");
+  }
+
+  const sourceVideoPath = findSourceVideoFilePath(sourceJob);
+  if (!sourceVideoPath || !fs.existsSync(sourceVideoPath)) {
+    return clipsJsonError(res, 422, "SOURCE_VIDEO_FILE_MISSING", "Source video file path is missing");
+  }
+
+  let sourceDurationMs;
+  try {
+    sourceDurationMs = await getMediaDurationMs(sourceVideoPath);
+  } catch (err) {
+    return clipsJsonError(
+      res,
+      422,
+      typeof err?.code === "string" ? err.code : "MEDIA_DURATION_UNAVAILABLE",
+      "Could not determine source video duration",
+    );
+  }
+
+  const clipExceedingDuration = clips.find((clip) => clip.endMs > sourceDurationMs);
+  if (clipExceedingDuration) {
+    return clipsJsonError(res, 422, "CLIP_EXCEEDS_SOURCE_DURATION", "One or more clips exceed the source video duration");
+  }
+
+  const now = Date.now();
+  const jobId = createJobId("job_clips");
+  const outputDir = ensureDirSync(getClipJobOutputDir(jobId));
+  const manifestPath = path.join(outputDir, "manifest.json");
+  const job = {
+    jobId,
+    type: "clips",
+    status: "queued",
+    createdAt: now,
+    updatedAt: now,
+    input: { sourceJobId, clips },
+    progress: {
+      total: clips.length,
+      completed: 0,
+      currentClipId: null,
+    },
+    result: buildClipJobResult(sourceJobId, outputDir, manifestPath),
+    error: null,
+    logs: [
+      {
+        at: now,
+        level: "info",
+        message: `clip job queued with ${clips.length} clip(s) from source job ${sourceJobId}`,
+      },
+    ],
+  };
+
+  fs.writeFileSync(manifestPath, JSON.stringify({
+    sourceJobId,
+    generatedAt: null,
+    clips: [],
+  }, null, 2));
+
+  await setJob(jobId, job);
+
+  setTimeout(() => {
+    processClipJob(jobId).catch((err) => {
+      console.error("clip processor failed", jobId, err);
+    });
+  }, 0);
+
+  return res.status(202).json({
+    ok: true,
+    jobId,
+    status: "queued",
   });
 });
 

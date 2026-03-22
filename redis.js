@@ -27,6 +27,20 @@ export async function setJob(jobId, job) {
   return job;
 }
 
+export async function appendJobLog(jobId, entry) {
+  const current = await getJob(jobId);
+  if (!current) return null;
+
+  const next = {
+    ...current,
+    logs: [...(Array.isArray(current.logs) ? current.logs : []), entry],
+    updatedAt: Date.now(),
+  };
+
+  await setJob(jobId, next);
+  return next;
+}
+
 export async function patchJob(jobId, patch) {
   const current = await getJob(jobId);
   if (!current) return null;
