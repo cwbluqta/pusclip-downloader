@@ -23,11 +23,13 @@ const { PORT = 3000, DOWNLOADER_TOKEN } = process.env;
 const RENDER_NODE_PATH = "/usr/bin/node";
 const COOKIES_PATH = path.resolve(process.cwd(), "cookies.txt");
 const JOB_OUTPUT_ROOT = path.join("/tmp", "pusclip-jobs");
+const UPLOAD_VIDEO_ROOT = path.join(JOB_OUTPUT_ROOT, "uploads");
 const hasRenderNodePath = fs.existsSync(RENDER_NODE_PATH);
 const CLIP_JOB_MIN_COUNT = 1;
 const CLIP_JOB_MAX_COUNT = 10;
 const CLIP_MIN_DURATION_MS = 3000;
 const CLIP_MAX_DURATION_MS = 120000;
+const MAX_UPLOAD_VIDEO_BYTES = Number(process.env.MAX_UPLOAD_VIDEO_BYTES ?? 250 * 1024 * 1024);
 
 function ensureCookiesFile() {
   if (fs.existsSync(COOKIES_PATH)) {
@@ -136,6 +138,14 @@ function clipsJsonError(res, status, code, details) {
   });
 }
 
+function uploadVideoJsonError(res, status, code, details) {
+  return res.status(status).json({
+    ok: false,
+    error: code,
+    details,
+  });
+}
+
 function createJobId(prefix = "job") {
   return `${prefix}_${crypto.randomBytes(12).toString("hex")}`;
 }
@@ -145,8 +155,32 @@ function ensureDirSync(dirPath) {
   return dirPath;
 }
 
+function removeFileIfExists(filePath) {
+  if (!filePath) return;
+
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch {}
+}
+
+function removeDirIfExists(dirPath) {
+  if (!dirPath) return;
+
+  try {
+    if (fs.existsSync(dirPath)) {
+      fs.rmSync(dirPath, { recursive: true, force: true });
+    }
+  } catch {}
+}
+
 function getClipJobOutputDir(jobId) {
   return path.join(JOB_OUTPUT_ROOT, jobId);
+}
+
+function getUploadVideoOutputDir(jobId) {
+  return path.join(UPLOAD_VIDEO_ROOT, jobId);
 }
 
 function isFiniteNumber(value) {
@@ -155,6 +189,197 @@ function isFiniteNumber(value) {
 
 function isSafeClipId(value) {
   return typeof value === "string" && /^[A-Za-z0-9_-]+$/.test(value);
+}
+
+function sanitizeUploadedFileName(fileName) {
+  const baseName = path.basename(String(fileName || "upload.mp4")).replace(/[^A-Za-z0-9._-]+/g, "_");
+  return baseName.toLowerCase().endsWith(".mp4") ? baseName : `${baseName}.mp4`;
+}
+
+function parseDispositionParameters(headerValue) {
+  const params = {};
+  const parts = String(headerValue || "").split(";").slice(1);
+
+  for (const rawPart of parts) {
+    const [rawKey, ...rawValueParts] = rawPart.split("=");
+    const key = rawKey?.trim()?.toLowerCase();
+    if (!key) continue;
+
+    const rawValue = rawValueParts.join("=").trim();
+    params[key] = rawValue.replace(/^"|"$/g, "");
+  }
+
+  return params;
+}
+
+function getMultipartBoundary(contentType) {
+  const match = String(contentType || "").match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+  return match?.[1] || match?.[2] || null;
+}
+
+function parseMultipartFormData(bodyBuffer, boundary) {
+  const delimiter = Buffer.from(`--${boundary}`);
+  const closingDelimiter = Buffer.from(`--${boundary}--`);
+  const headerSeparator = Buffer.from("\r\n\r\n");
+  const parts = [];
+  let cursor = bodyBuffer.indexOf(delimiter);
+
+  if (cursor === -1) {
+    const err = new Error("Multipart boundary was not found in request body");
+    err.code = "INVALID_MULTIPART_BODY";
+    throw err;
+  }
+
+  cursor += delimiter.length;
+
+  while (cursor < bodyBuffer.length) {
+    if (bodyBuffer[cursor] === 45 && bodyBuffer[cursor + 1] === 45) {
+      break;
+    }
+
+    if (bodyBuffer[cursor] === 13 && bodyBuffer[cursor + 1] === 10) {
+      cursor += 2;
+    }
+
+    const nextDelimiterIndex = bodyBuffer.indexOf(delimiter, cursor);
+    const nextClosingIndex = bodyBuffer.indexOf(closingDelimiter, cursor);
+    const partEnd = nextDelimiterIndex === -1 ? nextClosingIndex : nextDelimiterIndex;
+
+    if (partEnd === -1) {
+      const err = new Error("Multipart body terminated unexpectedly");
+      err.code = "INVALID_MULTIPART_BODY";
+      throw err;
+    }
+
+    let partBuffer = bodyBuffer.subarray(cursor, partEnd);
+    if (partBuffer.length >= 2 && partBuffer[partBuffer.length - 2] === 13 && partBuffer[partBuffer.length - 1] === 10) {
+      partBuffer = partBuffer.subarray(0, partBuffer.length - 2);
+    }
+
+    const headerEndIndex = partBuffer.indexOf(headerSeparator);
+    if (headerEndIndex === -1) {
+      const err = new Error("Multipart part is missing headers");
+      err.code = "INVALID_MULTIPART_BODY";
+      throw err;
+    }
+
+    const rawHeaders = partBuffer.subarray(0, headerEndIndex).toString("utf8");
+    const content = partBuffer.subarray(headerEndIndex + headerSeparator.length);
+    const headers = {};
+
+    for (const headerLine of rawHeaders.split("\r\n")) {
+      const separatorIndex = headerLine.indexOf(":");
+      if (separatorIndex === -1) continue;
+      const key = headerLine.slice(0, separatorIndex).trim().toLowerCase();
+      const value = headerLine.slice(separatorIndex + 1).trim();
+      headers[key] = value;
+    }
+
+    parts.push({ headers, content });
+    cursor = partEnd + delimiter.length;
+  }
+
+  return parts;
+}
+
+async function readMultipartRequest(req, maxBytes = MAX_UPLOAD_VIDEO_BYTES) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let totalBytes = 0;
+    let settled = false;
+
+    const finalizeReject = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+
+    const finalizeResolve = (buffer) => {
+      if (settled) return;
+      settled = true;
+      resolve(buffer);
+    };
+
+    req.on("data", (chunk) => {
+      totalBytes += chunk.length;
+
+      if (totalBytes > maxBytes) {
+        const err = new Error(`Uploaded file exceeds ${maxBytes} bytes`);
+        err.code = "UPLOAD_TOO_LARGE";
+        req.destroy(err);
+        return;
+      }
+
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => finalizeResolve(Buffer.concat(chunks)));
+    req.on("error", (error) => finalizeReject(error));
+    req.on("aborted", () => {
+      const err = new Error("Request was aborted before upload completed");
+      err.code = "UPLOAD_ABORTED";
+      finalizeReject(err);
+    });
+  });
+}
+
+async function parseSingleMp4Upload(req) {
+  const boundary = getMultipartBoundary(req.headers["content-type"]);
+  if (!boundary) {
+    const err = new Error("Content-Type must be multipart/form-data with a boundary");
+    err.code = "INVALID_CONTENT_TYPE";
+    throw err;
+  }
+
+  const bodyBuffer = await readMultipartRequest(req);
+  const parts = parseMultipartFormData(bodyBuffer, boundary);
+  const fileParts = parts
+    .map((part) => {
+      const disposition = part.headers["content-disposition"];
+      const dispositionParams = parseDispositionParameters(disposition);
+
+      return {
+        headers: part.headers,
+        content: part.content,
+        name: dispositionParams.name ?? null,
+        fileName: dispositionParams.filename ?? null,
+      };
+    })
+    .filter((part) => part.name === "file" && typeof part.fileName === "string" && part.fileName.length > 0);
+
+  if (!fileParts.length) {
+    const err = new Error('Missing uploaded file field "file"');
+    err.code = "MISSING_FILE";
+    throw err;
+  }
+
+  if (fileParts.length > 1) {
+    const err = new Error('Only one uploaded file is allowed for field "file"');
+    err.code = "TOO_MANY_FILES";
+    throw err;
+  }
+
+  const [filePart] = fileParts;
+  const mimeType = String(filePart.headers["content-type"] || "").trim().toLowerCase();
+
+  if (mimeType !== "video/mp4") {
+    const err = new Error('Only "video/mp4" uploads are supported');
+    err.code = "UNSUPPORTED_MEDIA_TYPE";
+    throw err;
+  }
+
+  if (!filePart.content.length) {
+    const err = new Error("Uploaded file is empty");
+    err.code = "EMPTY_FILE";
+    throw err;
+  }
+
+  return {
+    buffer: filePart.content,
+    fileName: sanitizeUploadedFileName(filePart.fileName),
+    mimeType,
+    originalFileName: filePart.fileName,
+  };
 }
 
 function findSourceVideoFilePath(job) {
@@ -978,6 +1203,75 @@ app.post("/clips", async (req, res) => {
     jobId,
     status: "queued",
   });
+});
+
+app.post("/upload-video", async (req, res) => {
+  let uploadDir = null;
+  let filePath = null;
+
+  try {
+    const upload = await parseSingleMp4Upload(req);
+    const now = Date.now();
+    const jobId = createJobId("job_upload_video");
+
+    uploadDir = ensureDirSync(getUploadVideoOutputDir(jobId));
+    filePath = path.join(uploadDir, upload.fileName);
+
+    fs.writeFileSync(filePath, upload.buffer);
+
+    let durationMs = null;
+    try {
+      durationMs = await getMediaDurationMs(filePath);
+    } catch (err) {
+      console.warn(`[upload-video] duration probe failed for ${filePath}:`, String(err?.message ?? err));
+    }
+
+    const job = {
+      jobId,
+      type: "upload-video",
+      status: "done",
+      createdAt: now,
+      updatedAt: now,
+      input: {
+        source: "local-upload",
+      },
+      result: {
+        video: {
+          filePath,
+          fileName: upload.originalFileName || upload.fileName,
+          mimeType: upload.mimeType,
+          durationMs,
+        },
+      },
+      error: null,
+    };
+
+    await setJob(jobId, job);
+
+    return res.status(200).json({
+      ok: true,
+      jobId,
+      status: "done",
+    });
+  } catch (err) {
+    removeFileIfExists(filePath);
+    removeDirIfExists(uploadDir);
+
+    const errorCode = typeof err?.code === "string" ? err.code : "UPLOAD_VIDEO_FAILED";
+    const details = String(err?.message ?? "Failed to ingest uploaded video");
+    const statusByCode = {
+      INVALID_CONTENT_TYPE: 400,
+      INVALID_MULTIPART_BODY: 400,
+      MISSING_FILE: 400,
+      TOO_MANY_FILES: 400,
+      EMPTY_FILE: 400,
+      UNSUPPORTED_MEDIA_TYPE: 415,
+      UPLOAD_TOO_LARGE: 413,
+      UPLOAD_ABORTED: 499,
+    };
+
+    return uploadVideoJsonError(res, statusByCode[errorCode] ?? 500, errorCode, details);
+  }
 });
 
 app.get("/jobs/:jobId", async (req, res) => {
