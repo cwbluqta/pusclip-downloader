@@ -5,7 +5,7 @@ import path from "path";
 import crypto from "crypto";
 import { spawn } from "child_process";
 import { generateVideoClip, getMediaDurationMs } from "./ffmpeg.js";
-import { appendJobLog, getJob, patchJob, redis, setJob } from "./redis.js";
+import { appendJobLog, createJob, failJob, getJob, patchJob, redis, setJob, updateJob } from "./redis.js";
 import { buildClipCandidates, getSourceTranscriptSegments } from "./analysis.js";
 import {
   getTranscriptionProviderName,
@@ -796,32 +796,124 @@ async function processClipJob(jobId) {
   }
 }
 
-function isTranscriptEmpty(payload) {
-  if (!payload) return true;
+const MIN_TRANSCRIPT_CHARS = Number(process.env.MIN_TRANSCRIPT_CHARS ?? 10);
 
-  // shape B (stored)
-  const tObj = payload.transcript && typeof payload.transcript === "object"
-    ? payload.transcript
-    : null;
+function validateTranscriptOrThrow(transcript) {
+  if (!transcript || typeof transcript !== "object") {
+    const err = new Error("Empty transcription: transcript is missing");
+    err.code = "TRANSCRIPT_EMPTY";
+    throw err;
+  }
 
-  const textB = tObj ? (tObj.text ?? "") : "";
-  const segB = tObj ? (tObj.segments ?? []) : null;
+  const text = typeof transcript.text === "string" ? transcript.text : "";
+  if (text.trim().length === 0) {
+    const err = new Error("Empty transcription: transcript text is blank");
+    err.code = "TRANSCRIPT_EMPTY";
+    throw err;
+  }
 
-  // shape A (raw)
-  const textA = typeof payload.transcript === "string" ? payload.transcript : "";
-  const segA = Array.isArray(payload.segments) ? payload.segments : null;
+  if (text.length < MIN_TRANSCRIPT_CHARS) {
+    const err = new Error(`Empty transcription: transcript is below minimum length (${MIN_TRANSCRIPT_CHARS})`);
+    err.code = "TRANSCRIPT_EMPTY";
+    throw err;
+  }
 
-  const text = (textB || textA || "");
-  const segs = (Array.isArray(segB) ? segB : (Array.isArray(segA) ? segA : []));
+  if (!Array.isArray(transcript.segments) || transcript.segments.length === 0) {
+    const err = new Error("Empty transcription: segments are missing");
+    err.code = "TRANSCRIPT_EMPTY";
+    throw err;
+  }
 
-  const textEmpty = text.trim().length === 0;
-  const segsEmpty = !Array.isArray(segs) || segs.length === 0 || segs.every((s) => {
-    const st = typeof s === "string" ? s : (s?.text ?? "");
-    return String(st).trim().length === 0;
-  });
+  let previousEnd = null;
+  for (const [index, segment] of transcript.segments.entries()) {
+    const start = Number(segment?.start);
+    const end = Number(segment?.end);
+    const segmentText = typeof segment?.text === "string" ? segment.text : "";
 
-  // treat as empty if BOTH text and segs are empty
-  return textEmpty && segsEmpty;
+    const invalidSegment = !Number.isFinite(start)
+      || !Number.isFinite(end)
+      || end <= start
+      || segmentText.trim().length === 0;
+
+    if (invalidSegment) {
+      const err = new Error(`Empty transcription: invalid segment at index ${index}`);
+      err.code = "TRANSCRIPT_EMPTY";
+      throw err;
+    }
+
+    if (previousEnd !== null && start < previousEnd) {
+      const err = new Error(`Empty transcription: inconsistent segment timeline at index ${index}`);
+      err.code = "TRANSCRIPT_EMPTY";
+      throw err;
+    }
+
+    previousEnd = end;
+  }
+
+  if (Number.isFinite(transcript.durationSeconds) && previousEnd !== null && previousEnd > transcript.durationSeconds + 1) {
+    const err = new Error("Empty transcription: inconsistent duration");
+    err.code = "TRANSCRIPT_EMPTY";
+    throw err;
+  }
+}
+
+async function processTranscriptionJob(jobId, url) {
+  let downloadedFilePath = null;
+
+  try {
+    if (!isTranscriptionProviderConfigured()) {
+      await failJob(jobId, "OPENAI_API_KEY is not configured", "transcribing");
+      return;
+    }
+
+    const downloading = await updateJob(jobId, {
+      status: "downloading",
+      step: "download",
+      progress: 10,
+      error: null,
+    });
+
+    if (!downloading) return;
+
+    downloadedFilePath = await downloadMediaForTranscription(url, jobId);
+
+    const extracting = await updateJob(jobId, {
+      status: "processing",
+      step: "extract_audio",
+      progress: 25,
+    });
+
+    if (!extracting) return;
+
+    const transcribing = await updateJob(jobId, {
+      status: "processing",
+      step: "transcribing",
+      progress: 50,
+    });
+
+    if (!transcribing) return;
+
+    const transcript = await transcribeAudioFile(downloadedFilePath);
+    validateTranscriptOrThrow(transcript);
+
+    await updateJob(jobId, {
+      status: "done",
+      step: "transcribing",
+      progress: 100,
+      result: { transcript },
+      error: null,
+    });
+  } catch (err) {
+    const message = String(err?.message ?? err);
+    await failJob(jobId, message, "transcribing");
+    console.error("job failed", jobId, message);
+  } finally {
+    if (downloadedFilePath) {
+      try {
+        fs.unlinkSync(downloadedFilePath);
+      } catch {}
+    }
+  }
 }
 
 // Guarda arquivos gerados em memória (id -> meta)
@@ -956,113 +1048,31 @@ app.post("/transcribe", async (req, res) => {
   if (!url || typeof url !== "string") {
     return res.status(400).json({
       ok: false,
-      error: { code: "BAD_REQUEST", message: "Invalid JSON body" },
+      error: { code: "BAD_REQUEST", message: "url must be a non-empty string" },
     });
   }
 
-  const now = Date.now();
+  const normalizedUrl = url.trim();
+  if (!normalizedUrl) {
+    return res.status(400).json({
+      ok: false,
+      error: { code: "BAD_REQUEST", message: "url must be a non-empty string" },
+    });
+  }
+
   const jobId = crypto.randomUUID();
-  const job = {
-    jobId,
-    type: "transcribe",
-    status: "queued",
-    createdAt: now,
-    updatedAt: now,
-    input: payload,
-    progress: { stage: "queued", pct: 0 },
-    result: {
-      transcript: { text: null, segments: null, language: null },
-    },
-    error: null,
-  };
+  await createJob({ jobId, input: { url: normalizedUrl } });
 
-  await setJob(jobId, job);
-  console.log("created job", jobId, "status=queued");
-
-  if (!isTranscriptionProviderConfigured()) {
-    await patchJob(jobId, {
-      status: "error",
-      progress: { stage: "error", pct: 100 },
-      error: {
-        code: "TRANSCRIPTION_PROVIDER_NOT_CONFIGURED",
-        message: "Transcription provider is not configured",
-      },
-    });
-  }
-
-  setTimeout(async () => {
-    try {
-      const updated = await patchJob(jobId, {
-        status: "processing",
-        progress: { stage: "transcribing", pct: 10 },
-      });
-      if (updated) console.log("job status transition", jobId, "-> processing");
-    } catch (err) {
-      const message = String(err?.message ?? err);
-      const errorCode = typeof err?.code === "string" ? err.code : "TRANSCRIBE_FAILED";
-      await patchJob(jobId, {
-        status: "error",
-        progress: { stage: "error", pct: 100 },
-        error: { code: errorCode, message },
-      });
-      console.error("job failed", jobId, message);
-    }
-  }, 400);
-
-  setTimeout(async () => {
-    let downloadedFilePath = null;
-
-    try {
-      downloadedFilePath = await downloadMediaForTranscription(url, jobId);
-      const transcript = await transcribeAudioFile(downloadedFilePath);
-
-      const finalResult = {
-        transcript,
-      };
-
-      if (isTranscriptEmpty(finalResult)) {
-        await patchJob(jobId, {
-          status: "error",
-          error: {
-            code: "TRANSCRIPT_EMPTY",
-            message: "Transcription returned empty content",
-          },
-          progress: { stage: "error", pct: 100 },
-        });
-        console.warn("job status transition", jobId, "-> error (TRANSCRIPT_EMPTY)");
-        return;
-      }
-
-      const updated = await patchJob(jobId, {
-        status: "done",
-        progress: { stage: "done", pct: 100 },
-        result: finalResult,
-        error: null,
-      });
-      if (updated) console.log("job status transition", jobId, "-> done");
-    } catch (err) {
-      const message = String(err?.message ?? err);
-      const errorCode = typeof err?.code === "string" ? err.code : "TRANSCRIBE_FAILED";
-      await patchJob(jobId, {
-        status: "error",
-        progress: { stage: "error", pct: 100 },
-        error: { code: errorCode, message },
-      });
-      console.error("job failed", jobId, message);
-    } finally {
-      if (downloadedFilePath) {
-        try {
-          fs.unlinkSync(downloadedFilePath);
-        } catch {}
-      }
-    }
-  }, 1800);
+  processTranscriptionJob(jobId, normalizedUrl).catch((err) => {
+    console.error("transcribe processor failed", jobId, err);
+  });
 
   return res.status(202).json({
-    ok: true,
     jobId,
+    status: "queued",
   });
 });
+
 
 
 app.post("/analyze", async (req, res) => {
@@ -1286,8 +1296,12 @@ app.get("/jobs/:jobId", async (req, res) => {
   }
 
   return res.status(200).json({
-    ok: true,
-    job,
+    jobId: job.jobId,
+    status: job.status,
+    step: job.step,
+    progress: job.progress,
+    result: job.result,
+    error: job.error,
   });
 });
 

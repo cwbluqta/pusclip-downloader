@@ -27,6 +27,51 @@ export async function setJob(jobId, job) {
   return job;
 }
 
+export async function createJob({ jobId, input }) {
+  const now = Date.now();
+  const job = {
+    jobId,
+    status: "queued",
+    step: "init",
+    progress: 0,
+    input,
+    result: null,
+    error: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await setJob(jobId, job);
+  return job;
+}
+
+export async function updateJob(jobId, patch) {
+  const current = await getJob(jobId);
+  if (!current) return null;
+
+  if (current.status === "done" || current.status === "error") {
+    return null;
+  }
+
+  const next = {
+    ...current,
+    ...patch,
+    updatedAt: Date.now(),
+  };
+
+  await setJob(jobId, next);
+  return next;
+}
+
+export async function failJob(jobId, error, step = "transcribing") {
+  const errorMessage = typeof error === "string" ? error : String(error?.message ?? "Job failed");
+  return updateJob(jobId, {
+    status: "error",
+    step,
+    error: errorMessage,
+  });
+}
+
 export async function appendJobLog(jobId, entry) {
   const current = await getJob(jobId);
   if (!current) return null;
@@ -54,6 +99,7 @@ export async function patchJob(jobId, patch) {
   const allowedTransitions = {
     queued: new Set(["queued", "processing", "error"]),
     processing: new Set(["processing", "done", "error"]),
+    downloading: new Set(["downloading", "processing", "done", "error"]),
   };
 
   if (
@@ -71,11 +117,11 @@ export async function patchJob(jobId, patch) {
     updatedAt: Date.now(),
   };
 
-  if (patch.progress) {
+  if (patch.progress && typeof patch.progress === "object" && !Array.isArray(patch.progress)) {
     next.progress = { ...(current.progress ?? {}), ...patch.progress };
   }
 
-  if (patch.result) {
+  if (patch.result && typeof patch.result === "object" && !Array.isArray(patch.result)) {
     next.result = { ...(current.result ?? {}), ...patch.result };
   }
 
