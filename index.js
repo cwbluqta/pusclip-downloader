@@ -1031,7 +1031,7 @@ app.post("/download", (req, res) => {
   try {
     baseArgs =
       want === "mp4"
-        ? [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", outTemplate, url]
+        ? [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bv*+ba/best", "--merge-output-format", "mp4", "-o", outTemplate, url]
         : [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
