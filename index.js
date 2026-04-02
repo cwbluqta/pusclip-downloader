@@ -3,7 +3,8 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
+import ffmpegPath from "ffmpeg-static";
 import { generateVideoClip, getMediaDurationMs } from "./ffmpeg.js";
 import { appendJobLog, createJob, failJob, getJob, patchJob, redis, setJob, updateJob } from "./redis.js";
 import { buildClipCandidates, getSourceTranscriptSegments } from "./analysis.js";
@@ -71,7 +72,7 @@ function runYtDlp(args, onClose) {
   const sanitized = sanitizeYtDlpArgsForLogs(args);
   console.log(`[yt-dlp] command: yt-dlp ${sanitized.join(" ")}`);
 
-  const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
+  const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"], env: buildYtDlpSpawnEnv() });
   let stderr = "";
   let finished = false;
 
@@ -85,7 +86,7 @@ function runYtDlp(args, onClose) {
     stderr += d.toString();
   });
   proc.on("error", (err) => {
-    stderr += `spawn error: ${err.message}`;
+    stderr += `spawn error: ${err.message}\n`;
     finalize(127);
   });
   proc.on("close", (code) => finalize(code ?? 1));
@@ -95,6 +96,29 @@ function runYtDlpAsync(args) {
   return new Promise((resolve) => {
     runYtDlp(args, (code, stderr) => resolve({ code, stderr }));
   });
+}
+
+function getRuntimeDependenciesStatus() {
+  const ytDlpVersionCheck = spawnSync("yt-dlp", ["--version"], { stdio: "ignore" });
+  const hasYtDlp = ytDlpVersionCheck.status === 0;
+
+  const hasFfmpegBinary = typeof ffmpegPath === "string" && ffmpegPath.length > 0 && fs.existsSync(ffmpegPath);
+
+  return { hasYtDlp, hasFfmpegBinary, ffmpegBinaryPath: ffmpegPath || null };
+}
+
+function buildYtDlpSpawnEnv() {
+  const env = { ...process.env };
+
+  if (typeof ffmpegPath === "string" && ffmpegPath) {
+    const ffmpegDir = path.dirname(ffmpegPath);
+    const currentPath = env.PATH || "";
+    if (!currentPath.split(path.delimiter).includes(ffmpegDir)) {
+      env.PATH = currentPath ? `${ffmpegDir}${path.delimiter}${currentPath}` : ffmpegDir;
+    }
+  }
+
+  return env;
 }
 
 function classifyDownloadError(stderr) {
@@ -971,6 +995,22 @@ app.post("/download", (req, res) => {
     return res.status(400).json({ error: "Only YouTube URLs supported for now" });
   }
 
+  const runtime = getRuntimeDependenciesStatus();
+  if (!runtime.hasYtDlp || !runtime.hasFfmpegBinary) {
+    const missing = [
+      !runtime.hasYtDlp ? "yt-dlp" : null,
+      !runtime.hasFfmpegBinary ? "ffmpeg" : null,
+    ].filter(Boolean);
+
+    const details = `Missing runtime dependencies: ${missing.join(", ")}. ffmpegPath=${runtime.ffmpegBinaryPath || "null"}`;
+    console.error(`[download] dependency check failed: ${details}`);
+
+    return res.status(500).json({
+      error: details,
+      details,
+    });
+  }
+
   const id = crypto.randomBytes(12).toString("hex");
   const outDir = "/tmp"; // Render OK
   const want = format === "mp4" ? "mp4" : "mp3";
@@ -987,10 +1027,20 @@ app.post("/download", (req, res) => {
     "youtube:player_client=android",
   ];
 
-  const baseArgs =
-    want === "mp4"
-      ? [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", outTemplate, url]
-      : [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
+  let baseArgs;
+  try {
+    baseArgs =
+      want === "mp4"
+        ? [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", outTemplate, url]
+        : [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[download] failed to build yt-dlp args: ${message}`);
+    return res.status(500).json({
+      error: message,
+      details: message,
+    });
+  }
 
   const firstAttemptArgs = ["--js-runtimes", "node", ...baseArgs];
   const fallbackRuntime = hasRenderNodePath ? `node:${RENDER_NODE_PATH}` : "node";
@@ -998,11 +1048,14 @@ app.post("/download", (req, res) => {
 
   const handleResult = (code, stderr) => {
     if (code !== 0) {
+      const details = String(stderr || "").trim().slice(-3000) || `yt-dlp exited with code ${code}`;
+      console.error("[yt-dlp] execution failed");
+      console.error(`[yt-dlp] exit code: ${code}`);
       console.error("[yt-dlp] stderr (full):\n" + stderr);
       return res.status(500).json({
-        error: "yt-dlp failed",
+        error: details,
         code,
-        details: stderr.slice(-1500),
+        details,
       });
     }
 
