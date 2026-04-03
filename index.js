@@ -521,8 +521,6 @@ async function downloadMediaForTranscription(url, outputId) {
     "Mozilla/5.0 (Linux; Android 11; Mobile)",
     "--add-header",
     "Referer: https://www.youtube.com/",
-    "--extractor-args",
-    "youtube:player_client=android",
     "--cookies",
     "cookies.txt",
   ];
@@ -1025,8 +1023,6 @@ app.post("/download", (req, res) => {
     "Mozilla/5.0 (Linux; Android 11; Mobile)",
     "--add-header",
     "Referer: https://www.youtube.com/",
-    "--extractor-args",
-    "youtube:player_client=android",
     "--cookies",
     "cookies.txt",
   ];
