@@ -517,6 +517,7 @@ async function downloadMediaForTranscription(url, outputId) {
   const outTemplate = path.join(outDir, `pusclip-transcribe-${outputId}.%(ext)s`);
   const commonArgs = [
     "--no-playlist",
+    "--remote-components",
     "--user-agent",
     "Mozilla/5.0 (Linux; Android 11; Mobile)",
     "--add-header",
@@ -1019,6 +1020,7 @@ app.post("/download", (req, res) => {
   // Args yt-dlp
   const commonArgs = [
     "--no-playlist",
+    "--remote-components",
     "--user-agent",
     "Mozilla/5.0 (Linux; Android 11; Mobile)",
     "--add-header",
