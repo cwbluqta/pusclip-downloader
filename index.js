@@ -523,6 +523,8 @@ async function downloadMediaForTranscription(url, outputId) {
     "Referer: https://www.youtube.com/",
     "--extractor-args",
     "youtube:player_client=android",
+    "--cookies",
+    "cookies.txt",
   ];
 
   const baseArgs = [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
@@ -1025,6 +1027,8 @@ app.post("/download", (req, res) => {
     "Referer: https://www.youtube.com/",
     "--extractor-args",
     "youtube:player_client=android",
+    "--cookies",
+    "cookies.txt",
   ];
 
   let baseArgs;
