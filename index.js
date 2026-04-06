@@ -1060,11 +1060,15 @@ app.post("/download", (req, res) => {
     "--max-sleep-interval", "5",
   ];
   let baseArgs;
+  let baseArgsWithoutFormat;
   try {
-    baseArgs =
-      want === "mp4"
-        ? [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bv*+ba/best", "--merge-output-format", "mp4", "-o", outTemplate, url]
-        : [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
+    if (want === "mp4") {
+      baseArgs = [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bv*+ba/best", "--merge-output-format", "mp4", "-o", outTemplate, url];
+      baseArgsWithoutFormat = [...getYtDlpBaseArgs(), ...commonArgs, "-o", outTemplate, url];
+    } else {
+      baseArgs = [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
+      baseArgsWithoutFormat = [...getYtDlpBaseArgs(), ...commonArgs, "-x", "--audio-format", "mp3", "-o", outTemplate, url];
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[download] failed to build yt-dlp args: ${message}`);
@@ -1080,6 +1084,7 @@ app.post("/download", (req, res) => {
   const firstAttemptArgs = ["--js-runtimes", "node", ...baseArgs];
   const fallbackRuntime = hasRenderNodePath ? `node:${RENDER_NODE_PATH}` : "node";
   const shouldRetryWithFallback = fallbackRuntime !== "node";
+  let triedWithoutFormat = false;
 
   const handleResult = (code, stdout, stderr) => {
     console.log(`[yt-dlp] exit code: ${code}`);
@@ -1135,7 +1140,23 @@ app.post("/download", (req, res) => {
     if (shouldRetryWithFallback && /No supported JavaScript runtime could be found/i.test(stderr)) {
       console.warn(`[yt-dlp] retrying with fallback runtime: ${fallbackRuntime}`);
       const fallbackArgs = ["--js-runtimes", fallbackRuntime, ...baseArgs];
-      return runYtDlp(fallbackArgs, handleResult);
+      return runYtDlp(fallbackArgs, (code2, stdout2, stderr2) => {
+        if (code2 === 0) return handleResult(code2, stdout2, stderr2);
+        if (!triedWithoutFormat && /Requested format is not available/i.test(stderr2)) {
+          console.warn(`[yt-dlp] retrying without format specifier`);
+          triedWithoutFormat = true;
+          const noFormatArgs = ["--js-runtimes", fallbackRuntime, ...baseArgsWithoutFormat];
+          return runYtDlp(noFormatArgs, handleResult);
+        }
+        return handleResult(code2, stdout2, stderr2);
+      });
+    }
+
+    if (!triedWithoutFormat && /Requested format is not available/i.test(stderr)) {
+      console.warn(`[yt-dlp] retrying without format specifier`);
+      triedWithoutFormat = true;
+      const noFormatArgs = ["--js-runtimes", "node", ...baseArgsWithoutFormat];
+      return runYtDlp(noFormatArgs, handleResult);
     }
 
     return handleResult(code, stdout, stderr);
