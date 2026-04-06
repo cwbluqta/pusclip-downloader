@@ -73,15 +73,19 @@ function runYtDlp(args, onClose) {
   console.log(`[yt-dlp] command: yt-dlp ${sanitized.join(" ")}`);
 
   const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"], env: buildYtDlpSpawnEnv() });
+  let stdout = "";
   let stderr = "";
   let finished = false;
 
   const finalize = (code) => {
     if (finished) return;
     finished = true;
-    onClose(code, stderr);
+    onClose(code, stdout, stderr);
   };
 
+  proc.stdout.on("data", (d) => {
+    stdout += d.toString();
+  });
   proc.stderr.on("data", (d) => {
     stderr += d.toString();
   });
@@ -101,7 +105,7 @@ function maskTokenForLogs(token) {
 
 function runYtDlpAsync(args) {
   return new Promise((resolve) => {
-    runYtDlp(args, (code, stderr) => resolve({ code, stderr }));
+    runYtDlp(args, (code, stdout, stderr) => resolve({ code, stdout, stderr }));
   });
 }
 
@@ -537,11 +541,11 @@ async function downloadMediaForTranscription(url, outputId) {
   const firstAttemptArgs = ["--js-runtimes", "node", ...baseArgs];
   const fallbackRuntime = hasRenderNodePath ? `node:${RENDER_NODE_PATH}` : "node";
 
-  let { code, stderr } = await runYtDlpAsync(firstAttemptArgs);
+  let { code, stdout, stderr } = await runYtDlpAsync(firstAttemptArgs);
 
   if (code !== 0 && fallbackRuntime !== "node" && /No supported JavaScript runtime could be found/i.test(stderr)) {
     console.warn(`[yt-dlp] retrying with fallback runtime: ${fallbackRuntime}`);
-    ({ code, stderr } = await runYtDlpAsync(["--js-runtimes", fallbackRuntime, ...baseArgs]));
+    ({ code, stdout, stderr } = await runYtDlpAsync(["--js-runtimes", fallbackRuntime, ...baseArgs]));
   }
 
   if (code !== 0) {
@@ -1051,6 +1055,9 @@ app.post("/download", (req, res) => {
     "--user-agent", "Mozilla/5.0 (Linux; Android 11; Mobile)",
     "--add-header", "Referer: https://www.youtube.com/",
     "--no-playlist",
+    "--extractor-retries", "3",
+    "--sleep-interval", "1",
+    "--max-sleep-interval", "5",
   ];
   let baseArgs;
   try {
@@ -1074,13 +1081,15 @@ app.post("/download", (req, res) => {
   const fallbackRuntime = hasRenderNodePath ? `node:${RENDER_NODE_PATH}` : "node";
   const shouldRetryWithFallback = fallbackRuntime !== "node";
 
-  const handleResult = (code, stderr) => {
+  const handleResult = (code, stdout, stderr) => {
+    console.log(`[yt-dlp] exit code: ${code}`);
+    if (stdout) console.log(`[yt-dlp] stdout:\n${stdout}`);
+    if (stderr) console.error(`[yt-dlp] stderr:\n${stderr}`);
+
     if (code !== 0) {
       const classified = classifyDownloadError(stderr);
       const details = String(stderr || "").trim().slice(-3000) || `yt-dlp exited with code ${code}`;
       console.error("[yt-dlp] execution failed");
-      console.error(`[yt-dlp] exit code: ${code}`);
-      console.error("[yt-dlp] stderr (full):\n" + stderr);
       return res.status(500).json({
         ok: false,
         error: {
@@ -1115,14 +1124,13 @@ app.post("/download", (req, res) => {
 
     return res.status(200).json({
       ok: true,
-      id,
+      assetId: id,
       filename,
-      downloadUrl: `/files/${id}`,
     });
   };
 
-  runYtDlp(firstAttemptArgs, (code, stderr) => {
-    if (code === 0) return handleResult(code, stderr);
+  runYtDlp(firstAttemptArgs, (code, stdout, stderr) => {
+    if (code === 0) return handleResult(code, stdout, stderr);
 
     if (shouldRetryWithFallback && /No supported JavaScript runtime could be found/i.test(stderr)) {
       console.warn(`[yt-dlp] retrying with fallback runtime: ${fallbackRuntime}`);
@@ -1130,7 +1138,7 @@ app.post("/download", (req, res) => {
       return runYtDlp(fallbackArgs, handleResult);
     }
 
-    return handleResult(code, stderr);
+    return handleResult(code, stdout, stderr);
   });
 });
 
@@ -1440,5 +1448,5 @@ app.listen(PORT, () => {
   if (!getTranscriptionProviderName()) {
     console.warn("[transcribe] OPENAI_API_KEY is not set. /transcribe jobs will fail with TRANSCRIPTION_PROVIDER_NOT_CONFIGURED");
   }
-  runYtDlp([...getYtDlpBaseArgs(), "--version"], () => {});
+  runYtDlp([...getYtDlpBaseArgs(), "--version"], (code, stdout, stderr) => {});
 });
