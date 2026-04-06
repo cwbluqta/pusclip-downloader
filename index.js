@@ -92,6 +92,13 @@ function runYtDlp(args, onClose) {
   proc.on("close", (code) => finalize(code ?? 1));
 }
 
+function maskTokenForLogs(token) {
+  const raw = String(token || "").trim();
+  if (!raw) return "<missing>";
+  if (raw.length <= 8) return `${raw[0]}***${raw.at(-1)}`;
+  return `${raw.slice(0, 4)}***${raw.slice(-4)}`;
+}
+
 function runYtDlpAsync(args) {
   return new Promise((resolve) => {
     runYtDlp(args, (code, stderr) => resolve({ code, stderr }));
@@ -958,8 +965,17 @@ setInterval(() => {
 function requireAuth(req, res) {
   const authHeader = req.get("authorization") || "";
   const expected = DOWNLOADER_TOKEN ? `Bearer ${DOWNLOADER_TOKEN}` : null;
+  const hasAuthHeader = Boolean(authHeader);
+  const isBearer = /^Bearer\s+/i.test(authHeader);
+  const gotToken = isBearer ? authHeader.replace(/^Bearer\s+/i, "").trim() : "";
+  const matches = Boolean(expected && authHeader === expected);
 
-  if (!expected || authHeader !== expected) {
+  console.info(
+    `[auth] ${req.path} authorization_present=${hasAuthHeader} bearer_format=${isBearer} token_match=${matches} provided_token=${maskTokenForLogs(gotToken)}`,
+  );
+
+  if (!expected || !matches) {
+    console.warn("[auth] unauthorized request rejected");
     res.status(401).json({ error: "Unauthorized" });
     return false;
   }
@@ -996,6 +1012,18 @@ app.post("/download", (req, res) => {
     return res.status(400).json({ error: "Only YouTube URLs supported for now" });
   }
 
+  const envStatus = {
+    hasDownloaderToken: Boolean(DOWNLOADER_TOKEN),
+    hasCookiesEnv: Boolean(process.env.YTDLP_COOKIES),
+    hasCookiesFile: fs.existsSync(COOKIES_PATH),
+    hasOpenAiKey: Boolean(process.env.OPENAI_API_KEY),
+    hasRedisUrl: Boolean(process.env.UPSTASH_REDIS_REST_URL),
+    hasRedisToken: Boolean(process.env.UPSTASH_REDIS_REST_TOKEN),
+  };
+  console.info(
+    `[download] env status token=${envStatus.hasDownloaderToken} cookies_env=${envStatus.hasCookiesEnv} cookies_file=${envStatus.hasCookiesFile} openai=${envStatus.hasOpenAiKey} redis_url=${envStatus.hasRedisUrl} redis_token=${envStatus.hasRedisToken}`,
+  );
+
   const runtime = getRuntimeDependenciesStatus();
   if (!runtime.hasYtDlp || !runtime.hasFfmpegBinary) {
     const missing = [
@@ -1025,8 +1053,6 @@ app.post("/download", (req, res) => {
     "Mozilla/5.0 (Linux; Android 11; Mobile)",
     "--add-header",
     "Referer: https://www.youtube.com/",
-    "--cookies",
-    "cookies.txt",
   ];
 
   let baseArgs;
@@ -1039,8 +1065,11 @@ app.post("/download", (req, res) => {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[download] failed to build yt-dlp args: ${message}`);
     return res.status(500).json({
-      error: message,
-      details: message,
+      ok: false,
+      error: {
+        code: "DOWNLOADER_ENV_INVALID",
+        message,
+      },
     });
   }
 
@@ -1050,14 +1079,19 @@ app.post("/download", (req, res) => {
 
   const handleResult = (code, stderr) => {
     if (code !== 0) {
+      const classified = classifyDownloadError(stderr);
       const details = String(stderr || "").trim().slice(-3000) || `yt-dlp exited with code ${code}`;
       console.error("[yt-dlp] execution failed");
       console.error(`[yt-dlp] exit code: ${code}`);
       console.error("[yt-dlp] stderr (full):\n" + stderr);
       return res.status(500).json({
-        error: details,
-        code,
+        ok: false,
+        error: {
+          code: classified.code,
+          message: classified.message,
+        },
         details,
+        exitCode: code,
       });
     }
 
@@ -1067,11 +1101,18 @@ app.post("/download", (req, res) => {
     const filePath = fs.existsSync(mp3Path) ? mp3Path : fs.existsSync(mp4Path) ? mp4Path : null;
 
     if (!filePath) {
-      return res.status(500).json({ error: "download finished but file not found" });
+      return res.status(500).json({
+        ok: false,
+        error: {
+          code: "DOWNLOAD_OUTPUT_NOT_FOUND",
+          message: "download finished but file not found",
+        },
+      });
     }
 
     const filename = path.basename(filePath);
     const mime = filename.endsWith(".mp3") ? "audio/mpeg" : "video/mp4";
+    console.info(`[download] output generated asset_id=${id} filename=${filename} mime=${mime}`);
 
     files.set(id, { filePath, createdAt: Date.now(), mime, filename });
 
