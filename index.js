@@ -1047,14 +1047,11 @@ app.post("/download", (req, res) => {
 
   // Args yt-dlp
   const commonArgs = [
+    "--remote-components", "js:github",
+    "--user-agent", "Mozilla/5.0 (Linux; Android 11; Mobile)",
+    "--add-header", "Referer: https://www.youtube.com/",
     "--no-playlist",
-    "--remote-components",
-    "--user-agent",
-    "Mozilla/5.0 (Linux; Android 11; Mobile)",
-    "--add-header",
-    "Referer: https://www.youtube.com/",
   ];
-
   let baseArgs;
   try {
     baseArgs =
