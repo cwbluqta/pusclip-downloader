@@ -1002,8 +1002,61 @@ app.get("/files/:id", (req, res) => {
   return res.sendFile(meta.filePath);
 });
 
+function extractFirstJsonObject(rawText) {
+  const text = String(rawText || "");
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  return text.slice(start, end + 1);
+}
+
+function pickBestAvailableAudioFormat(formats) {
+  const audioOnly = formats
+    .filter((fmt) => fmt && fmt.acodec && fmt.acodec !== "none" && (!fmt.vcodec || fmt.vcodec === "none") && fmt.format_id)
+    .sort((a, b) => Number(b.abr || 0) - Number(a.abr || 0));
+
+  if (audioOnly.length) return audioOnly[0].format_id;
+
+  const withAudio = formats
+    .filter((fmt) => fmt && fmt.acodec && fmt.acodec !== "none" && fmt.format_id)
+    .sort((a, b) => Number(b.tbr || b.abr || 0) - Number(a.tbr || a.abr || 0));
+
+  return withAudio.length ? withAudio[0].format_id : null;
+}
+
+async function fetchAvailableAudioFormat(url, commonArgs) {
+  const listArgs = ["--js-runtimes", "deno", ...getYtDlpBaseArgs(), ...commonArgs, "-J", url];
+  console.info(`[download] listing available formats before mp3 conversion`);
+  console.info(`[download] format list command: yt-dlp ${sanitizeYtDlpArgsForLogs(listArgs).join(" ")}`);
+
+  const { code, stdout, stderr } = await runYtDlpAsync(listArgs);
+  console.log(`[yt-dlp] format list exit code: ${code}`);
+  if (stdout) console.log(`[yt-dlp] format list stdout:\n${stdout}`);
+  if (stderr) console.error(`[yt-dlp] format list stderr:\n${stderr}`);
+  if (code !== 0) return null;
+
+  const jsonText = extractFirstJsonObject(stdout);
+  if (!jsonText) return null;
+
+  try {
+    const parsed = JSON.parse(jsonText);
+    const formats = Array.isArray(parsed?.formats) ? parsed.formats : [];
+    const selected = pickBestAvailableAudioFormat(formats);
+    if (selected) {
+      console.info(`[download] selected available audio format_id=${selected}`);
+    } else {
+      console.warn("[download] no specific audio format_id found from listing");
+    }
+    return selected;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[download] could not parse format listing JSON: ${message}`);
+    return null;
+  }
+}
+
 // Download real com yt-dlp (mp3 padrão, mp4 opcional)
-app.post("/download", (req, res) => {
+app.post("/download", async (req, res) => {
   if (!requireAuth(req, res)) return;
 
   const { url, format } = req.body || {};
@@ -1051,23 +1104,82 @@ app.post("/download", (req, res) => {
 
   // Args yt-dlp
   const commonArgs = [
-    "--remote-components", "js:github",
-    "--user-agent", "Mozilla/5.0 (Linux; Android 11; Mobile)",
-    "--add-header", "Referer: https://www.youtube.com/",
     "--no-playlist",
     "--extractor-retries", "3",
     "--sleep-interval", "1",
     "--max-sleep-interval", "5",
   ];
-  let baseArgs;
-  let baseArgsWithoutFormat;
+  let attempts = [];
   try {
     if (want === "mp4") {
-      baseArgs = [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bv*+ba/best", "--merge-output-format", "mp4", "-o", outTemplate, url];
-      baseArgsWithoutFormat = [...getYtDlpBaseArgs(), ...commonArgs, "-o", outTemplate, url];
+      const mp4Args = [
+        "--js-runtimes",
+        "deno",
+        ...getYtDlpBaseArgs(),
+        ...commonArgs,
+        "-f",
+        "bv*+ba/b",
+        "--merge-output-format",
+        "mp4",
+        "-o",
+        outTemplate,
+        url,
+      ];
+      attempts = [{ label: "mp4-default", args: mp4Args }];
     } else {
-      baseArgs = [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
-      baseArgsWithoutFormat = [...getYtDlpBaseArgs(), ...commonArgs, "-x", "--audio-format", "mp3", "-o", outTemplate, url];
+      const selectedAudioFormat = await fetchAvailableAudioFormat(url, commonArgs);
+      if (selectedAudioFormat) {
+        attempts.push({
+          label: "mp3-selected-audio-format",
+          args: [
+            "--js-runtimes",
+            "deno",
+            ...getYtDlpBaseArgs(),
+            ...commonArgs,
+            "-f",
+            selectedAudioFormat,
+            "-x",
+            "--audio-format",
+            "mp3",
+            "-o",
+            outTemplate,
+            url,
+          ],
+        });
+      }
+
+      attempts.push({
+        label: "mp3-bestaudio-best",
+        args: [
+          "--js-runtimes",
+          "deno",
+          ...getYtDlpBaseArgs(),
+          ...commonArgs,
+          "-f",
+          "bestaudio/best",
+          "-x",
+          "--audio-format",
+          "mp3",
+          "-o",
+          outTemplate,
+          url,
+        ],
+      });
+      attempts.push({
+        label: "mp3-no-format-fallback",
+        args: [
+          "--js-runtimes",
+          "deno",
+          ...getYtDlpBaseArgs(),
+          ...commonArgs,
+          "-x",
+          "--audio-format",
+          "mp3",
+          "-o",
+          outTemplate,
+          url,
+        ],
+      });
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1081,85 +1193,63 @@ app.post("/download", (req, res) => {
     });
   }
 
-  const firstAttemptArgs = ["--js-runtimes", "node", ...baseArgs];
-  const fallbackRuntime = hasRenderNodePath ? `node:${RENDER_NODE_PATH}` : "node";
-  const shouldRetryWithFallback = fallbackRuntime !== "node";
-  let triedWithoutFormat = false;
+  console.info(`[download] requested format=${want}`);
 
-  const handleResult = (code, stdout, stderr) => {
-    console.log(`[yt-dlp] exit code: ${code}`);
-    if (stdout) console.log(`[yt-dlp] stdout:\n${stdout}`);
-    if (stderr) console.error(`[yt-dlp] stderr:\n${stderr}`);
+  let lastResult = null;
+  for (const attempt of attempts) {
+    console.info(`[download] running attempt=${attempt.label}`);
+    console.info(`[download] final command: yt-dlp ${sanitizeYtDlpArgsForLogs(attempt.args).join(" ")}`);
 
-    if (code !== 0) {
-      const classified = classifyDownloadError(stderr);
-      const details = String(stderr || "").trim().slice(-3000) || `yt-dlp exited with code ${code}`;
-      console.error("[yt-dlp] execution failed");
-      return res.status(500).json({
-        ok: false,
-        error: {
-          code: classified.code,
-          message: classified.message,
-        },
-        details,
-        exitCode: code,
-      });
-    }
+    const result = await runYtDlpAsync(attempt.args);
+    lastResult = result;
+    console.log(`[yt-dlp] attempt=${attempt.label} exit code: ${result.code}`);
+    if (result.stdout) console.log(`[yt-dlp] attempt=${attempt.label} stdout:\n${result.stdout}`);
+    if (result.stderr) console.error(`[yt-dlp] attempt=${attempt.label} stderr:\n${result.stderr}`);
 
-    // Acha o arquivo gerado
-    const mp3Path = path.join(outDir, `pusclip-${id}.mp3`);
-    const mp4Path = path.join(outDir, `pusclip-${id}.mp4`);
-    const filePath = fs.existsSync(mp3Path) ? mp3Path : fs.existsSync(mp4Path) ? mp4Path : null;
+    if (result.code === 0) break;
+  }
 
-    if (!filePath) {
-      return res.status(500).json({
-        ok: false,
-        error: {
-          code: "DOWNLOAD_OUTPUT_NOT_FOUND",
-          message: "download finished but file not found",
-        },
-      });
-    }
-
-    const filename = path.basename(filePath);
-    const mime = filename.endsWith(".mp3") ? "audio/mpeg" : "video/mp4";
-    console.info(`[download] output generated asset_id=${id} filename=${filename} mime=${mime}`);
-
-    files.set(id, { filePath, createdAt: Date.now(), mime, filename });
-
-    return res.status(200).json({
-      ok: true,
-      assetId: id,
-      filename,
+  if (!lastResult || lastResult.code !== 0) {
+    const stderr = lastResult?.stderr || "";
+    const classified = classifyDownloadError(stderr);
+    const details = String(stderr).trim().slice(-3000) || `yt-dlp exited with code ${lastResult?.code ?? 1}`;
+    console.error("[yt-dlp] execution failed after all attempts");
+    return res.status(500).json({
+      ok: false,
+      error: {
+        code: classified.code,
+        message: classified.message,
+      },
+      details,
+      exitCode: lastResult?.code ?? 1,
     });
-  };
+  }
 
-  runYtDlp(firstAttemptArgs, (code, stdout, stderr) => {
-    if (code === 0) return handleResult(code, stdout, stderr);
+  // Acha o arquivo gerado
+  const mp3Path = path.join(outDir, `pusclip-${id}.mp3`);
+  const mp4Path = path.join(outDir, `pusclip-${id}.mp4`);
+  const filePath = fs.existsSync(mp3Path) ? mp3Path : fs.existsSync(mp4Path) ? mp4Path : null;
 
-    if (shouldRetryWithFallback && /No supported JavaScript runtime could be found/i.test(stderr)) {
-      console.warn(`[yt-dlp] retrying with fallback runtime: ${fallbackRuntime}`);
-      const fallbackArgs = ["--js-runtimes", fallbackRuntime, ...baseArgs];
-      return runYtDlp(fallbackArgs, (code2, stdout2, stderr2) => {
-        if (code2 === 0) return handleResult(code2, stdout2, stderr2);
-        if (!triedWithoutFormat && /Requested format is not available/i.test(stderr2)) {
-          console.warn(`[yt-dlp] retrying without format specifier`);
-          triedWithoutFormat = true;
-          const noFormatArgs = ["--js-runtimes", fallbackRuntime, ...baseArgsWithoutFormat];
-          return runYtDlp(noFormatArgs, handleResult);
-        }
-        return handleResult(code2, stdout2, stderr2);
-      });
-    }
+  if (!filePath) {
+    return res.status(500).json({
+      ok: false,
+      error: {
+        code: "DOWNLOAD_OUTPUT_NOT_FOUND",
+        message: "download finished but file not found",
+      },
+    });
+  }
 
-    if (!triedWithoutFormat && /Requested format is not available/i.test(stderr)) {
-      console.warn(`[yt-dlp] retrying without format specifier`);
-      triedWithoutFormat = true;
-      const noFormatArgs = ["--js-runtimes", "node", ...baseArgsWithoutFormat];
-      return runYtDlp(noFormatArgs, handleResult);
-    }
+  const filename = path.basename(filePath);
+  const mime = filename.endsWith(".mp3") ? "audio/mpeg" : "video/mp4";
+  console.info(`[download] output generated asset_id=${id} filename=${filename} mime=${mime}`);
 
-    return handleResult(code, stdout, stderr);
+  files.set(id, { filePath, createdAt: Date.now(), mime, filename });
+
+  return res.status(200).json({
+    ok: true,
+    assetId: id,
+    filename,
   });
 });
 
