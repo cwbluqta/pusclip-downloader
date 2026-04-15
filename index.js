@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import crypto from "crypto";
 import { spawn, spawnSync } from "child_process";
@@ -22,8 +23,9 @@ app.use(express.json({ limit: "2mb" }));
 const { PORT = 3000, DOWNLOADER_TOKEN } = process.env;
 
 const RENDER_NODE_PATH = "/usr/bin/node";
+const TEMP_ROOT = os.tmpdir();
 const COOKIES_PATH = path.resolve(process.cwd(), "cookies.txt");
-const JOB_OUTPUT_ROOT = path.join("/tmp", "pusclip-jobs");
+const JOB_OUTPUT_ROOT = path.join(TEMP_ROOT, "pusclip-jobs");
 const UPLOAD_VIDEO_ROOT = path.join(JOB_OUTPUT_ROOT, "uploads");
 const hasRenderNodePath = fs.existsSync(RENDER_NODE_PATH);
 const CLIP_JOB_MIN_COUNT = 1;
@@ -68,11 +70,52 @@ function sanitizeYtDlpArgsForLogs(args) {
   return args.map((arg) => (typeof arg === "string" && /^https?:\/\//.test(arg) ? sanitizeUrlForLogs(arg) : arg));
 }
 
-function runYtDlp(args, onClose) {
+function summarizePathForLogs(pathValue) {
+  if (!pathValue) return "<empty>";
+  const parts = pathValue.split(path.delimiter);
+  const head = parts.slice(0, 6);
+  const suffix = parts.length > head.length ? ` ... (+${parts.length - head.length} more)` : "";
+  return `${head.join(path.delimiter)}${suffix}`;
+}
+
+function buildYtDlpLogContext(args, spawnOptions = {}) {
+  const env = spawnOptions.env || process.env;
+  const cwd = spawnOptions.cwd || process.cwd();
+
+  return {
+    cwd,
+    jsRuntimes: (() => {
+      const index = args.indexOf("--js-runtimes");
+      return index >= 0 ? args[index + 1] || "<missing>" : "<not-set>";
+    })(),
+    cookiesPath: (() => {
+      const index = args.indexOf("--cookies");
+      return index >= 0 ? args[index + 1] || "<missing>" : "<not-set>";
+    })(),
+    outputTemplate: (() => {
+      const index = args.indexOf("-o");
+      return index >= 0 ? args[index + 1] || "<missing>" : "<not-set>";
+    })(),
+    pathHead: summarizePathForLogs(env.PATH || ""),
+    nodeEnv: env.NODE_ENV || "<unset>",
+    tempDir: env.TMPDIR || env.TMP || env.TEMP || "<unset>",
+  };
+}
+
+function runYtDlp(args, onClose, spawnOptions = {}) {
   const sanitized = sanitizeYtDlpArgsForLogs(args);
   console.log(`[yt-dlp] command: yt-dlp ${sanitized.join(" ")}`);
+  const ctx = buildYtDlpLogContext(args, spawnOptions);
+  console.log(
+    `[yt-dlp] context cwd=${ctx.cwd} js_runtime=${ctx.jsRuntimes} cookies=${ctx.cookiesPath} output=${ctx.outputTemplate} temp=${ctx.tempDir} node_env=${ctx.nodeEnv}`,
+  );
+  console.log(`[yt-dlp] context PATH(head)=${ctx.pathHead}`);
 
-  const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"], env: buildYtDlpSpawnEnv() });
+  const proc = spawn("yt-dlp", args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: spawnOptions.env || buildYtDlpSpawnEnv(),
+    cwd: spawnOptions.cwd || process.cwd(),
+  });
   let stdout = "";
   let stderr = "";
   let finished = false;
@@ -103,9 +146,9 @@ function maskTokenForLogs(token) {
   return `${raw.slice(0, 4)}***${raw.slice(-4)}`;
 }
 
-function runYtDlpAsync(args) {
+function runYtDlpAsync(args, spawnOptions = {}) {
   return new Promise((resolve) => {
-    runYtDlp(args, (code, stdout, stderr) => resolve({ code, stdout, stderr }));
+    runYtDlp(args, (code, stdout, stderr) => resolve({ code, stdout, stderr }), spawnOptions);
   });
 }
 
@@ -524,7 +567,7 @@ function validateClipRequestBody(body) {
 }
 
 async function downloadMediaForTranscription(url, outputId) {
-  const outDir = "/tmp";
+  const outDir = TEMP_ROOT;
   const outTemplate = path.join(outDir, `pusclip-transcribe-${outputId}.%(ext)s`);
   const commonArgs = [
     "--no-playlist",
@@ -1024,6 +1067,38 @@ function pickBestAvailableAudioFormat(formats) {
   return withAudio.length ? withAudio[0].format_id : null;
 }
 
+function buildDownloadAttempts({ url, format, outTemplate, commonArgs }) {
+  const want = format === "mp4" ? "mp4" : "mp3";
+  const cookieArgs = getYtDlpBaseArgs();
+  const manualEquivalentPrefix = ["--js-runtimes", "deno", ...cookieArgs];
+
+  if (want === "mp4") {
+    return {
+      want,
+      attempts: [
+        {
+          label: "mp4-manual-equivalent",
+          args: [...manualEquivalentPrefix, "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", outTemplate, url],
+        },
+      ],
+    };
+  }
+
+  return {
+    want,
+    attempts: [
+      {
+        label: "mp3-bestaudio-best",
+        args: [...manualEquivalentPrefix, ...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url],
+      },
+      {
+        label: "mp3-no-format-fallback",
+        args: [...manualEquivalentPrefix, ...commonArgs, "-x", "--audio-format", "mp3", "-o", outTemplate, url],
+      },
+    ],
+  };
+}
+
 async function fetchAvailableAudioFormat(url, commonArgs) {
   const listArgs = ["--js-runtimes", "deno", ...getYtDlpBaseArgs(), ...commonArgs, "-J", url];
   console.info(`[download] listing available formats before mp3 conversion`);
@@ -1098,8 +1173,7 @@ app.post("/download", async (req, res) => {
   }
 
   const id = crypto.randomBytes(12).toString("hex");
-  const outDir = "/tmp"; // Render OK
-  const want = format === "mp4" ? "mp4" : "mp3";
+  const outDir = TEMP_ROOT;
   const outTemplate = path.join(outDir, `pusclip-${id}.%(ext)s`);
 
   // Args yt-dlp
@@ -1110,26 +1184,16 @@ app.post("/download", async (req, res) => {
     "--max-sleep-interval", "5",
   ];
   let attempts = [];
+  let want = "mp3";
   try {
-    if (want === "mp4") {
-      const mp4Args = [
-        "--js-runtimes",
-        "deno",
-        ...getYtDlpBaseArgs(),
-        ...commonArgs,
-        "-f",
-        "bv*+ba/b",
-        "--merge-output-format",
-        "mp4",
-        "-o",
-        outTemplate,
-        url,
-      ];
-      attempts = [{ label: "mp4-default", args: mp4Args }];
-    } else {
+    const built = buildDownloadAttempts({ url, format, outTemplate, commonArgs });
+    want = built.want;
+    attempts = built.attempts;
+
+    if (want !== "mp4") {
       const selectedAudioFormat = await fetchAvailableAudioFormat(url, commonArgs);
       if (selectedAudioFormat) {
-        attempts.push({
+        attempts.unshift({
           label: "mp3-selected-audio-format",
           args: [
             "--js-runtimes",
@@ -1147,39 +1211,6 @@ app.post("/download", async (req, res) => {
           ],
         });
       }
-
-      attempts.push({
-        label: "mp3-bestaudio-best",
-        args: [
-          "--js-runtimes",
-          "deno",
-          ...getYtDlpBaseArgs(),
-          ...commonArgs,
-          "-f",
-          "bestaudio/best",
-          "-x",
-          "--audio-format",
-          "mp3",
-          "-o",
-          outTemplate,
-          url,
-        ],
-      });
-      attempts.push({
-        label: "mp3-no-format-fallback",
-        args: [
-          "--js-runtimes",
-          "deno",
-          ...getYtDlpBaseArgs(),
-          ...commonArgs,
-          "-x",
-          "--audio-format",
-          "mp3",
-          "-o",
-          outTemplate,
-          url,
-        ],
-      });
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
