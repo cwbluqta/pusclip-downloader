@@ -56,9 +56,30 @@ function getYtDlpBaseArgs() {
 
 function getJsRuntimeValue() {
   const isWindows = process.platform === "win32";
-  const runtime = isWindows && fs.existsSync(WINDOWS_DENO_PATH) ? WINDOWS_DENO_PATH : "deno";
-  console.log(`[yt-dlp] resolved --js-runtimes value: ${runtime}`);
+  const windowsDenoExists = fs.existsSync(WINDOWS_DENO_PATH);
+  const runtime = isWindows && windowsDenoExists ? WINDOWS_DENO_PATH : "deno";
+
+  console.log(`[yt-dlp] process.platform=${process.platform}`);
+  console.log(`[yt-dlp] WINDOWS_DENO_PATH=${WINDOWS_DENO_PATH}`);
+  console.log(`[yt-dlp] fs.existsSync(WINDOWS_DENO_PATH)=${windowsDenoExists}`);
+  console.log(`[yt-dlp] getJsRuntimeValue()=${runtime}`);
+
   return runtime;
+}
+
+function withResolvedJsRuntime(args) {
+  const normalizedArgs = [];
+
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === "--js-runtimes") {
+      i += 1;
+      continue;
+    }
+
+    normalizedArgs.push(args[i]);
+  }
+
+  return ["--js-runtimes", getJsRuntimeValue(), ...normalizedArgs];
 }
 
 function sanitizeUrlForLogs(raw) {
@@ -111,15 +132,16 @@ function buildYtDlpLogContext(args, spawnOptions = {}) {
 }
 
 function runYtDlp(args, onClose, spawnOptions = {}) {
-  const sanitized = sanitizeYtDlpArgsForLogs(args);
+  const resolvedArgs = withResolvedJsRuntime(args);
+  const sanitized = sanitizeYtDlpArgsForLogs(resolvedArgs);
   console.log(`[yt-dlp] command: yt-dlp ${sanitized.join(" ")}`);
-  const ctx = buildYtDlpLogContext(args, spawnOptions);
+  const ctx = buildYtDlpLogContext(resolvedArgs, spawnOptions);
   console.log(
     `[yt-dlp] context cwd=${ctx.cwd} js_runtime=${ctx.jsRuntimes} cookies=${ctx.cookiesPath} output=${ctx.outputTemplate} temp=${ctx.tempDir} node_env=${ctx.nodeEnv}`,
   );
   console.log(`[yt-dlp] context PATH(head)=${ctx.pathHead}`);
 
-  const proc = spawn("yt-dlp", args, {
+  const proc = spawn("yt-dlp", resolvedArgs, {
     stdio: ["ignore", "pipe", "pipe"],
     env: spawnOptions.env || buildYtDlpSpawnEnv(),
     cwd: spawnOptions.cwd || process.cwd(),
@@ -589,16 +611,7 @@ async function downloadMediaForTranscription(url, outputId) {
   ];
 
   const baseArgs = [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
-  const firstRuntime = getJsRuntimeValue();
-  const firstAttemptArgs = ["--js-runtimes", firstRuntime, ...baseArgs];
-  const fallbackRuntime = getJsRuntimeValue();
-
-  let { code, stdout, stderr } = await runYtDlpAsync(firstAttemptArgs);
-
-  if (code !== 0 && fallbackRuntime !== firstRuntime && /No supported JavaScript runtime could be found/i.test(stderr)) {
-    console.warn(`[yt-dlp] retrying with fallback runtime: ${fallbackRuntime}`);
-    ({ code, stdout, stderr } = await runYtDlpAsync(["--js-runtimes", fallbackRuntime, ...baseArgs]));
-  }
+  const { code, stdout, stderr } = await runYtDlpAsync(baseArgs);
 
   if (code !== 0) {
     const classifiedError = classifyDownloadError(stderr);
@@ -1079,7 +1092,7 @@ function pickBestAvailableAudioFormat(formats) {
 function buildDownloadAttempts({ url, format, outTemplate, commonArgs }) {
   const want = format === "mp4" ? "mp4" : "mp3";
   const cookieArgs = getYtDlpBaseArgs();
-  const manualEquivalentPrefix = ["--js-runtimes", getJsRuntimeValue(), ...cookieArgs];
+  const manualEquivalentPrefix = [...cookieArgs];
 
   if (want === "mp4") {
     return {
@@ -1109,7 +1122,7 @@ function buildDownloadAttempts({ url, format, outTemplate, commonArgs }) {
 }
 
 async function fetchAvailableAudioFormat(url, commonArgs) {
-  const listArgs = ["--js-runtimes", getJsRuntimeValue(), ...getYtDlpBaseArgs(), ...commonArgs, "-J", url];
+  const listArgs = [...getYtDlpBaseArgs(), ...commonArgs, "-J", url];
   console.info(`[download] listing available formats before mp3 conversion`);
   console.info(`[download] format list command: yt-dlp ${sanitizeYtDlpArgsForLogs(listArgs).join(" ")}`);
 
@@ -1205,8 +1218,6 @@ app.post("/download", async (req, res) => {
         attempts.unshift({
           label: "mp3-selected-audio-format",
           args: [
-            "--js-runtimes",
-            getJsRuntimeValue(),
             ...getYtDlpBaseArgs(),
             ...commonArgs,
             "-f",
@@ -1599,5 +1610,5 @@ app.listen(PORT, () => {
   if (!getTranscriptionProviderName()) {
     console.warn("[transcribe] OPENAI_API_KEY is not set. /transcribe jobs will fail with TRANSCRIPTION_PROVIDER_NOT_CONFIGURED");
   }
-  runYtDlp(["--js-runtimes", getJsRuntimeValue(), ...getYtDlpBaseArgs(), "--version"], (code, stdout, stderr) => {});
+  runYtDlp([...getYtDlpBaseArgs(), "--version"], (code, stdout, stderr) => {});
 });
