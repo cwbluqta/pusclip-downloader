@@ -22,13 +22,11 @@ app.use(express.json({ limit: "2mb" }));
 
 const { PORT = 3000, DOWNLOADER_TOKEN } = process.env;
 
-const RENDER_NODE_PATH = "/usr/bin/node";
 const WINDOWS_DENO_PATH = "C:\\Users\\rhosa\\AppData\\Local\\Microsoft\\WinGet\\Links\\deno.exe";
 const TEMP_ROOT = os.tmpdir();
 const COOKIES_PATH = path.resolve(process.cwd(), "cookies.txt");
 const JOB_OUTPUT_ROOT = path.join(TEMP_ROOT, "pusclip-jobs");
 const UPLOAD_VIDEO_ROOT = path.join(JOB_OUTPUT_ROOT, "uploads");
-const hasRenderNodePath = fs.existsSync(RENDER_NODE_PATH);
 const CLIP_JOB_MIN_COUNT = 1;
 const CLIP_JOB_MAX_COUNT = 10;
 const CLIP_MIN_DURATION_MS = 3000;
