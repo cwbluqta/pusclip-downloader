@@ -23,6 +23,7 @@ app.use(express.json({ limit: "2mb" }));
 const { PORT = 3000, DOWNLOADER_TOKEN } = process.env;
 
 const RENDER_NODE_PATH = "/usr/bin/node";
+const WINDOWS_DENO_PATH = "C:\\Users\\rhosa\\AppData\\Local\\Microsoft\\WinGet\\Links\\deno.exe";
 const TEMP_ROOT = os.tmpdir();
 const COOKIES_PATH = path.resolve(process.cwd(), "cookies.txt");
 const JOB_OUTPUT_ROOT = path.join(TEMP_ROOT, "pusclip-jobs");
@@ -51,6 +52,13 @@ function ensureCookiesFile() {
 function getYtDlpBaseArgs() {
   const cookiePath = ensureCookiesFile();
   return ["--cookies", cookiePath];
+}
+
+function getJsRuntimeValue() {
+  const isWindows = process.platform === "win32";
+  const runtime = isWindows && fs.existsSync(WINDOWS_DENO_PATH) ? WINDOWS_DENO_PATH : "deno";
+  console.log(`[yt-dlp] resolved --js-runtimes value: ${runtime}`);
+  return runtime;
 }
 
 function sanitizeUrlForLogs(raw) {
@@ -581,12 +589,13 @@ async function downloadMediaForTranscription(url, outputId) {
   ];
 
   const baseArgs = [...getYtDlpBaseArgs(), ...commonArgs, "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "-o", outTemplate, url];
-  const firstAttemptArgs = ["--js-runtimes", "node", ...baseArgs];
-  const fallbackRuntime = hasRenderNodePath ? `node:${RENDER_NODE_PATH}` : "node";
+  const firstRuntime = getJsRuntimeValue();
+  const firstAttemptArgs = ["--js-runtimes", firstRuntime, ...baseArgs];
+  const fallbackRuntime = getJsRuntimeValue();
 
   let { code, stdout, stderr } = await runYtDlpAsync(firstAttemptArgs);
 
-  if (code !== 0 && fallbackRuntime !== "node" && /No supported JavaScript runtime could be found/i.test(stderr)) {
+  if (code !== 0 && fallbackRuntime !== firstRuntime && /No supported JavaScript runtime could be found/i.test(stderr)) {
     console.warn(`[yt-dlp] retrying with fallback runtime: ${fallbackRuntime}`);
     ({ code, stdout, stderr } = await runYtDlpAsync(["--js-runtimes", fallbackRuntime, ...baseArgs]));
   }
@@ -1070,7 +1079,7 @@ function pickBestAvailableAudioFormat(formats) {
 function buildDownloadAttempts({ url, format, outTemplate, commonArgs }) {
   const want = format === "mp4" ? "mp4" : "mp3";
   const cookieArgs = getYtDlpBaseArgs();
-  const manualEquivalentPrefix = ["--js-runtimes", "deno", ...cookieArgs];
+  const manualEquivalentPrefix = ["--js-runtimes", getJsRuntimeValue(), ...cookieArgs];
 
   if (want === "mp4") {
     return {
@@ -1100,7 +1109,7 @@ function buildDownloadAttempts({ url, format, outTemplate, commonArgs }) {
 }
 
 async function fetchAvailableAudioFormat(url, commonArgs) {
-  const listArgs = ["--js-runtimes", "deno", ...getYtDlpBaseArgs(), ...commonArgs, "-J", url];
+  const listArgs = ["--js-runtimes", getJsRuntimeValue(), ...getYtDlpBaseArgs(), ...commonArgs, "-J", url];
   console.info(`[download] listing available formats before mp3 conversion`);
   console.info(`[download] format list command: yt-dlp ${sanitizeYtDlpArgsForLogs(listArgs).join(" ")}`);
 
@@ -1197,7 +1206,7 @@ app.post("/download", async (req, res) => {
           label: "mp3-selected-audio-format",
           args: [
             "--js-runtimes",
-            "deno",
+            getJsRuntimeValue(),
             ...getYtDlpBaseArgs(),
             ...commonArgs,
             "-f",
@@ -1590,5 +1599,5 @@ app.listen(PORT, () => {
   if (!getTranscriptionProviderName()) {
     console.warn("[transcribe] OPENAI_API_KEY is not set. /transcribe jobs will fail with TRANSCRIPTION_PROVIDER_NOT_CONFIGURED");
   }
-  runYtDlp([...getYtDlpBaseArgs(), "--version"], (code, stdout, stderr) => {});
+  runYtDlp(["--js-runtimes", getJsRuntimeValue(), ...getYtDlpBaseArgs(), "--version"], (code, stdout, stderr) => {});
 });
