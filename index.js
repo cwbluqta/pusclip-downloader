@@ -55,19 +55,22 @@ function getYtDlpBaseArgs() {
 }
 
 function getJsRuntimeValue() {
-  const isWindows = process.platform === "win32";
-  const windowsDenoExists = fs.existsSync(WINDOWS_DENO_PATH);
-  const runtime = isWindows && windowsDenoExists ? WINDOWS_DENO_PATH : "deno";
+  const isWin = process.platform === "win32";
+  const exists = fs.existsSync(WINDOWS_DENO_PATH);
 
-  console.log(`[yt-dlp] process.platform=${process.platform}`);
-  console.log(`[yt-dlp] WINDOWS_DENO_PATH=${WINDOWS_DENO_PATH}`);
-  console.log(`[yt-dlp] fs.existsSync(WINDOWS_DENO_PATH)=${windowsDenoExists}`);
-  console.log(`[yt-dlp] getJsRuntimeValue()=${runtime}`);
+  console.log("[runtime] process.platform =", process.platform);
+  console.log("[runtime] WINDOWS_DENO_PATH =", WINDOWS_DENO_PATH);
+  console.log("[runtime] existsSync =", exists);
 
-  return runtime;
+  const value = isWin && exists ? WINDOWS_DENO_PATH : "deno";
+
+  console.log("[runtime] resolved --js-runtimes value =", value);
+
+  return value;
 }
 
 function withResolvedJsRuntime(args) {
+  const jsRuntime = getJsRuntimeValue();
   const normalizedArgs = [];
 
   for (let i = 0; i < args.length; i += 1) {
@@ -79,7 +82,7 @@ function withResolvedJsRuntime(args) {
     normalizedArgs.push(args[i]);
   }
 
-  return ["--js-runtimes", getJsRuntimeValue(), ...normalizedArgs];
+  return ["--js-runtimes", jsRuntime, ...normalizedArgs];
 }
 
 function sanitizeUrlForLogs(raw) {
