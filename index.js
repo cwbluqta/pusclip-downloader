@@ -67,22 +67,6 @@ function getJsRuntimeValue() {
   return value;
 }
 
-function withResolvedJsRuntime(args) {
-  const jsRuntime = getJsRuntimeValue();
-  const normalizedArgs = [];
-
-  for (let i = 0; i < args.length; i += 1) {
-    if (args[i] === "--js-runtimes") {
-      i += 1;
-      continue;
-    }
-
-    normalizedArgs.push(args[i]);
-  }
-
-  return ["--js-runtimes", jsRuntime, ...normalizedArgs];
-}
-
 function sanitizeUrlForLogs(raw) {
   try {
     const parsed = new URL(raw);
@@ -133,7 +117,16 @@ function buildYtDlpLogContext(args, spawnOptions = {}) {
 }
 
 function runYtDlp(args, onClose, spawnOptions = {}) {
-  const resolvedArgs = withResolvedJsRuntime(args);
+  const jsRuntime = getJsRuntimeValue();
+  const normalizedArgs = [];
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === "--js-runtimes") {
+      i += 1;
+      continue;
+    }
+    normalizedArgs.push(args[i]);
+  }
+  const resolvedArgs = ["--js-runtimes", jsRuntime, ...normalizedArgs];
   const sanitized = sanitizeYtDlpArgsForLogs(resolvedArgs);
   console.log(`[yt-dlp] command: yt-dlp ${sanitized.join(" ")}`);
   const ctx = buildYtDlpLogContext(resolvedArgs, spawnOptions);
