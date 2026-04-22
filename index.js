@@ -22,7 +22,8 @@ app.use(express.json({ limit: "2mb" }));
 
 const { PORT = 3000, DOWNLOADER_TOKEN } = process.env;
 
-const WINDOWS_DENO_PATH = "C:\\Users\\rhosa\\AppData\\Local\\Microsoft\\WinGet\\Links\\deno.exe";
+const WINDOWS_DENO_PATH =
+  "C:\\Users\\rhosa\\AppData\\Local\\Microsoft\\WinGet\\Packages\\DenoLand.Deno_Microsoft.Winget.Source_8wekyb3d8bbwe\\deno.exe";
 const TEMP_ROOT = os.tmpdir();
 const COOKIES_PATH = path.resolve(process.cwd(), "cookies.txt");
 const JOB_OUTPUT_ROOT = path.join(TEMP_ROOT, "pusclip-jobs");
